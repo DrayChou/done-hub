@@ -160,8 +160,29 @@ func RequestErrorHandle(key string) requester.HttpErrorHandler {
 		resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 		geminiError := &GeminiErrorResponse{}
-		if err := json.NewDecoder(resp.Body).Decode(geminiError); err == nil {
+		if err := json.Unmarshal(bodyBytes, geminiError); err == nil && geminiError.ErrorInfo != nil {
 			return buildOpenAIErrorFromGemini(geminiError, key)
+		}
+		// Some Gemini gateways return FastAPI's {detail: string|array} instead
+		// of Google's {error: ...}. Preserve diagnostics, never the credential or
+		// validation input (which may include prompts/images) from detail arrays.
+		var gatewayError struct {
+			Detail json.RawMessage `json:"detail"`
+		}
+		if json.Unmarshal(bodyBytes, &gatewayError) == nil && len(gatewayError.Detail) > 0 {
+			message := "upstream parameter validation failed"
+			var detail string
+			if json.Unmarshal(gatewayError.Detail, &detail) == nil && detail != "" {
+				message = detail
+			}
+			if key != "" {
+				message = strings.ReplaceAll(message, key, "[redacted]")
+			}
+			message = truncateBase64InMessage(message)
+			if len(message) > 2048 {
+				message = message[:2048] + "...[truncated]"
+			}
+			return &types.OpenAIError{Code: resp.StatusCode, Type: "upstream_error", Message: message}
 		}
 		geminiErrors := &GeminiErrors{}
 		// 长度判空：GeminiErrors.Error() 内部直接 (*e)[0]，空切片会 panic

@@ -1,228 +1,171 @@
 package gemini
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"done-hub/common"
+	"done-hub/common/cache"
+	"done-hub/common/logger"
+	"done-hub/common/utils"
+	"done-hub/model"
+	"done-hub/types"
 	"encoding/json"
-	"sync"
+	"fmt"
+	"io"
+	"net/http"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-
-	"done-hub/model"
 )
-
-// thoughtSignature 回填
-//
-// 背景：Gemini 3/4 返回 functionCall 时会附带 thoughtSignature，下一次请求必须把该签名
-// 原样放回同一个 functionCall part，否则上游 400 INVALID_ARGUMENT。
-//
-// 走 OpenAI 协议的客户端（Pi / Claude Code / 各类 SDK）拿不到也回传不了这个字段，
-// Done Hub 在 Gemini ⇄ OpenAI 之间转换时它会被丢弃，于是工具循环第二轮必挂。
-//
-// 本文件在渠道内部补上这一段：
-//   - 响应：把上游返回的签名按 (函数名 + 规范化参数) 与 id 记入缓存
-//   - 请求：发现 functionCall 缺签名时回填；缓存未命中则回填官方哨兵
-//
-// 默认关闭，需在渠道 plugin 中显式开启：
-//   {"gemini_signature_autofill": {"enable": true}}
-//
-// 之所以要显式开启：哨兵值 skip_thought_signature_validator 只被部分网关接受，
-// 官方 Gemini / Vertex 会判定为非法签名（见 clean_bytes.go 中的历史说明）。
 
 const (
-	// ThoughtSignatureAutofillPlugin 是渠道插件里的开关名
+	// Real signatures are preserved automatically. This opt-in only permits the
+	// upstream's documented escape hatch when a signature cannot be recovered.
 	ThoughtSignatureAutofillPlugin = "gemini_signature_autofill"
-	// signatureCacheTTL 覆盖正常工具循环的间隔即可
-	signatureCacheTTL = 30 * time.Minute
-	signatureCacheMax = 5000
+	signatureCacheTTL              = 24 * time.Hour
 )
 
-type signatureEntry struct {
-	signature string
-	at        time.Time
+type cachedThoughtSignature struct {
+	Signature string
+	CallHash  string
 }
 
-var (
-	signatureMu    sync.RWMutex
-	signatureCache = map[string]signatureEntry{}
-)
+func signatureCallHash(name string, args map[string]interface{}) string {
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+	raw, _ := json.Marshal(args)
+	sum := sha256.Sum256(append([]byte(name+"\x00"), raw...))
+	return fmt.Sprintf("%x", sum)
+}
 
-// SignatureAutofillEnabled 判断渠道是否开启签名回填
 func SignatureAutofillEnabled(channel *model.Channel) bool {
 	if channel == nil || channel.Plugin == nil {
 		return false
 	}
-	plugin := channel.Plugin.Data()
-	item, ok := plugin[ThoughtSignatureAutofillPlugin]
-	if !ok {
-		return false
-	}
-	enable, _ := item["enable"].(bool)
-	return enable
+	enabled, _ := channel.Plugin.Data()[ThoughtSignatureAutofillPlugin]["enable"].(bool)
+	return enabled
 }
 
-func signatureArgsKey(name string, args map[string]interface{}) string {
-	if name == "" {
+// Reuse the existing bounded memory/Redis cache. Credentials are hashed, never
+// stored in cache keys or logs. A generated client-facing call ID identifies one
+// occurrence, even when concurrent sessions call the same function/arguments.
+func thoughtSignatureScope(channel *model.Channel, ctx *gin.Context, modelName string) string {
+	if channel == nil || ctx == nil || ctx.GetInt("id") <= 0 {
 		return ""
 	}
-	// encoding/json 序列化 map 时按 key 排序，结果稳定，可直接作为缓存键
-	raw, err := json.Marshal(args)
-	if err != nil {
-		return ""
-	}
-	return "a:" + name + "|" + string(raw)
+	credential := sha256.Sum256([]byte(channel.Key))
+	return fmt.Sprintf("%d:%d:%s:%x", channel.Id, ctx.GetInt("id"), modelName, credential)
 }
 
-func storeSignature(code string, signature string) {
-	if code == "" || signature == "" {
+func thoughtSignatureKey(scope, callID string) string {
+	if scope == "" || callID == "" {
+		return ""
+	}
+	key := sha256.Sum256([]byte(scope + "\x00" + callID))
+	return fmt.Sprintf("gemini:thought_signature:%x", key)
+}
+
+// Called before conversion exposes tool calls to the client, not after a stream
+// callback. Native Gemini responses are not rewritten and retain their signatures.
+func preserveFunctionCallSignatures(scope string, candidates []GeminiChatCandidate) {
+	if scope == "" {
 		return
 	}
-	signatureMu.Lock()
-	signatureCache[code] = signatureEntry{signature: signature, at: time.Now()}
-	// 简单容量控制：超限时清理过期项，仍超限则整体清空（缓存可丢，不可泄漏内存）
-	if len(signatureCache) > signatureCacheMax {
-		now := time.Now()
-		for key, entry := range signatureCache {
-			if now.Sub(entry.at) > signatureCacheTTL {
-				delete(signatureCache, key)
+	for i := range candidates {
+		for j := range candidates[i].Content.Parts {
+			part := &candidates[i].Content.Parts[j]
+			if part.FunctionCall == nil {
+				continue
+			}
+			// Never trust upstream IDs to be globally unique (some gateways reuse them).
+			part.FunctionCall.clientID = "call_" + utils.GetUUID()
+			var signature string
+			if json.Unmarshal(part.ThoughtSignature, &signature) != nil || signature == "" {
+				continue
+			}
+			entry := cachedThoughtSignature{Signature: signature, CallHash: signatureCallHash(part.FunctionCall.Name, part.FunctionCall.Args)}
+			if err := cache.SetCache(thoughtSignatureKey(scope, part.FunctionCall.clientID), entry, signatureCacheTTL); err != nil {
+				logger.SysError("[Gemini] signature cache write failed; subsequent request may require fallback")
 			}
 		}
-		if len(signatureCache) > signatureCacheMax {
-			signatureCache = map[string]signatureEntry{}
-		}
 	}
-	signatureMu.Unlock()
 }
 
-func loadSignature(codes ...string) string {
-	now := time.Now()
-	signatureMu.RLock()
-	defer signatureMu.RUnlock()
-	for _, code := range codes {
-		if code == "" {
-			continue
-		}
-		entry, ok := signatureCache[code]
-		if !ok || now.Sub(entry.at) > signatureCacheTTL {
-			continue
-		}
-		return entry.signature
+// Only model function-call parts may receive a recovered signature. Existing
+// signatures, malformed input and tool-result payloads are never overwritten.
+func restoreThoughtSignatures(data []byte, scope string, allowFallback bool) ([]byte, int, int, error) {
+	if !gjson.ValidBytes(data) {
+		return data, 0, 0, nil
 	}
-	return ""
-}
-
-// RememberSignatures 记录一次响应里所有带签名的 functionCall
-func RememberSignatures(candidates []GeminiChatCandidate) {
-	for _, candidate := range candidates {
-		for _, part := range candidate.Content.Parts {
-			if part.FunctionCall == nil || len(part.ThoughtSignature) == 0 {
+	restored, fallback := 0, 0
+	for i, content := range gjson.GetBytes(data, "contents").Array() {
+		if content.Get("role").String() != "model" {
+			continue
+		}
+		for j, part := range content.Get("parts").Array() {
+			call := part.Get("functionCall")
+			if !call.IsObject() {
+				call = part.Get("function_call")
+			}
+			if !call.IsObject() || part.Get("thoughtSignature").Exists() || part.Get("thought_signature").Exists() {
 				continue
 			}
 			var signature string
-			if err := json.Unmarshal(part.ThoughtSignature, &signature); err != nil {
-				continue
-			}
-			if signature == "" {
-				continue
-			}
-			storeSignature("id:"+part.FunctionCall.Id, signature)
-			storeSignature(signatureArgsKey(part.FunctionCall.Name, part.FunctionCall.Args), signature)
-		}
-	}
-}
-
-// fillMissingSignatures 遍历 contents，为缺签名的 functionCall 回填缓存值或官方哨兵
-func fillMissingSignatures(data []byte) ([]byte, int) {
-	contents := gjson.GetBytes(data, "contents")
-	if !contents.Exists() {
-		return data, 0
-	}
-
-	filled := 0
-	for i, content := range contents.Array() {
-		parts := content.Get("parts")
-		if !parts.Exists() {
-			continue
-		}
-		for j, part := range parts.Array() {
-			if !part.Get("functionCall").Exists() {
-				continue
-			}
-			if part.Get("thoughtSignature").Exists() {
-				continue
-			}
-			name := part.Get("functionCall.name").String()
-			code := "id:" + part.Get("functionCall.id").String()
-			argsCode := ""
-			if args := part.Get("functionCall.args"); args.Exists() {
-				argsCode = signatureArgsKey(name, args.Value().(map[string]interface{}))
-				if argsCode == "" {
-					argsCode = "a:" + name
+			if key := thoughtSignatureKey(scope, call.Get("id").String()); key != "" {
+				entry, err := cache.GetCache[cachedThoughtSignature](key)
+				var args map[string]interface{}
+				argsJSON := call.Get("args")
+				validArgs := !argsJSON.Exists() || json.Unmarshal([]byte(argsJSON.Raw), &args) == nil
+				if err == nil && validArgs && entry.CallHash == signatureCallHash(call.Get("name").String(), args) {
+					signature = entry.Signature
 				}
 			}
-			signature := loadSignature(code, argsCode)
 			if signature == "" {
-				// 缓存未命中：用官方哨兵跳过校验，保证工具循环能继续
+				if !allowFallback {
+					continue
+				}
 				signature = SkipThoughtSignatureValidator
+				fallback++
+			} else {
+				restored++
 			}
-			path := "contents." + itoa(i) + ".parts." + itoa(j) + ".thoughtSignature"
+			path := fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", i, j)
 			updated, err := sjson.SetBytes(data, path, signature)
 			if err != nil {
-				continue
+				return nil, 0, 0, err
 			}
 			data = updated
-			filled++
 		}
 	}
-	return data, filled
+	return data, restored, fallback, nil
 }
 
-// InjectMissingSignatures 供请求构造阶段调用
-func InjectMissingSignatures(data []byte) ([]byte, int) {
-	return fillMissingSignatures(data)
-}
-
-func itoa(v int) string {
-	if v == 0 {
-		return "0"
+// Run on the final HTTP body, after custom parameters and every raw/map/struct
+// conversion path. Do not store channel-specific fallback signatures in the
+// shared processed-body cache: a retry may select a different provider/channel.
+func (p *GeminiProvider) prepareThoughtSignatures(req *http.Request) *types.OpenAIErrorWithStatusCode {
+	if req == nil || req.Body == nil {
+		return nil
 	}
-	var buf [20]byte
-	pos := len(buf)
-	for v > 0 {
-		pos--
-		buf[pos] = byte('0' + v%10)
-		v /= 10
+	data, err := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	if err != nil {
+		return common.ErrorWrapper(err, "read_gemini_request_failed", http.StatusInternalServerError)
 	}
-	return string(buf[pos:])
-}
-
-// FillSignaturesInRequest 在结构体请求路径上回填缺失的 thoughtSignature
-// 返回回填数量。OpenAI 协议进来的 chat 请求走这条路径，而不是原始字节路径。
-func FillSignaturesInRequest(request *GeminiChatRequest) int {
-	if request == nil {
-		return 0
+	scope := thoughtSignatureScope(p.GetChannel(), p.GetContext(), p.OriginalModel)
+	data, restored, fallback, err := restoreThoughtSignatures(data, scope, SignatureAutofillEnabled(p.GetChannel()))
+	if err != nil {
+		return common.ErrorWrapper(err, "restore_gemini_signature_failed", http.StatusInternalServerError)
 	}
-	filled := 0
-	for i := range request.Contents {
-		parts := request.Contents[i].Parts
-		for j := range parts {
-			part := &parts[j]
-			if part.FunctionCall == nil || len(part.ThoughtSignature) > 0 {
-				continue
-			}
-			code := "id:" + part.FunctionCall.Id
-			argsCode := signatureArgsKey(part.FunctionCall.Name, part.FunctionCall.Args)
-			signature := loadSignature(code, argsCode)
-			if signature == "" {
-				signature = SkipThoughtSignatureValidator
-			}
-			raw, err := json.Marshal(signature)
-			if err != nil {
-				continue
-			}
-			part.ThoughtSignature = raw
-			filled++
-		}
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	req.ContentLength = int64(len(data))
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil }
+	if restored+fallback > 0 {
+		// Counts only: signatures, arguments and credentials must never enter logs.
+		logger.SysLog(fmt.Sprintf("[Gemini] signatures restored=%d fallback=%d channel=%d", restored, fallback, p.GetChannel().Id))
 	}
-	return filled
+	return nil
 }

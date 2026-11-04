@@ -8,9 +8,7 @@ import (
 	"done-hub/common/utils"
 	"done-hub/providers/base"
 	"done-hub/types"
-	"done-hub/common/logger"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -25,8 +23,11 @@ type GeminiStreamHandler struct {
 	Usage   *types.Usage
 	Request *types.ChatCompletionRequest
 
-	Key     string
-	Context *gin.Context // 添加 Context 用于获取响应模型名称
+	Key            string
+	Context        *gin.Context // 添加 Context 用于获取响应模型名称
+	signatureScope string
+	toolIndices    map[int]int
+	toolUsed       map[int]bool
 }
 
 type OpenAIStreamHandler struct {
@@ -57,7 +58,7 @@ func (p *GeminiProvider) CreateChatCompletion(request *types.ChatCompletionReque
 		return nil, errWithCode
 	}
 
-	RememberSignatures(geminiChatResponse.Candidates)
+	preserveFunctionCallSignatures(thoughtSignatureScope(p.GetChannel(), p.GetContext(), p.OriginalModel), geminiChatResponse.Candidates)
 
 	return ConvertToChatOpenai(p, geminiChatResponse, request)
 }
@@ -90,14 +91,23 @@ func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Usage:   p.Usage,
 		Request: request,
 
-		Key:     channel.Key,
-		Context: p.Context, // 传递 Context
+		Key:            channel.Key,
+		Context:        p.Context, // 传递 Context
+		signatureScope: thoughtSignatureScope(channel, p.Context, p.OriginalModel),
 	}
 
 	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerStream)
 }
 
-func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRelay bool) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRelay bool) (reqOut *http.Request, apiErr *types.OpenAIErrorWithStatusCode) {
+	defer func() {
+		if apiErr == nil {
+			if apiErr = p.prepareThoughtSignatures(reqOut); apiErr != nil {
+				reqOut = nil
+			}
+		}
+	}()
+
 	// 根据 Action 确定正确的 URL
 	url := p.getActionURL(geminiRequest)
 	// 获取请求地址
@@ -107,12 +117,6 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 	headers := p.GetRequestHeaders()
 	if geminiRequest.Stream {
 		headers["Accept"] = "text/event-stream"
-	}
-
-	if !isRelay && SignatureAutofillEnabled(p.GetChannel()) {
-		if filled := FillSignaturesInRequest(geminiRequest); filled > 0 {
-			logger.SysLog(fmt.Sprintf("[Gemini] filled %d thoughtSignature(s) for channel %d", filled, p.GetChannel().Id))
-		}
 	}
 
 	if isRelay {
@@ -133,12 +137,6 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 			cleaned, err := CleanGeminiRequestBytes(rawData, false)
 			if err != nil {
 				return nil, common.ErrorWrapper(err, "clean_gemini_request_bytes_failed", http.StatusInternalServerError)
-			}
-			if SignatureAutofillEnabled(p.GetChannel()) {
-				if filled, count := InjectMissingSignatures(cleaned); count > 0 {
-					cleaned = filled
-					logger.SysLog(fmt.Sprintf("[Gemini] filled %d thoughtSignature(s) for channel %d", count, p.GetChannel().Id))
-				}
 			}
 			p.SetProcessedBodyBytes(cleaned, false)
 			req, errWithCode := p.NewRequestWithCustomParamsBytes(http.MethodPost, fullRequestURL, cleaned, headers, geminiRequest.Model)
@@ -484,44 +482,6 @@ func validateAndFixFunctionCallSequence(contents []interface{}) []interface{} {
 	}
 
 	return contents
-}
-
-// cleanSchemaRecursively 递归清理 schema 对象中的 $schema 和 additionalProperties 字段
-// geminiUnsupportedSchemaKeys 是 Gemini functionDeclarations.parameters 不接受、
-// 但 OpenAI 生态（Pi / Claude Code / 各类 SDK）普遍会带的 JSON Schema 关键字。
-// 上游命中任意一个都返回 400 Parameter validation error，必须在转换时剥掉。
-//
-// 依据 2026-11 对 apimodel.net 的实测：patternProperties / $schema / $ref / $defs /
-// const / examples / deprecated 会导致 400；additionalProperties / anyOf / oneOf /
-// format / minLength / maximum / default / title 可以正常通过。
-var geminiUnsupportedSchemaKeys = []string{
-	"patternProperties",
-	"$schema", "$ref", "$defs", "definitions", "$comment", "$id", "$anchor",
-	"const", "examples", "deprecated",
-	"if", "then", "else", "not", "propertyNames",
-	"unevaluatedProperties", "unevaluatedItems",
-	"dependencies", "dependentSchemas", "dependentRequired",
-}
-
-func cleanSchemaRecursively(obj interface{}) {
-	switch v := obj.(type) {
-	case map[string]interface{}:
-		// 删除 Gemini API 不支持的字段
-		for _, key := range geminiUnsupportedSchemaKeys {
-			delete(v, key)
-		}
-		delete(v, "additionalProperties")
-
-		// 递归处理所有值
-		for _, value := range v {
-			cleanSchemaRecursively(value)
-		}
-	case []interface{}:
-		// 递归处理数组中的每个元素
-		for _, item := range v {
-			cleanSchemaRecursively(item)
-		}
-	}
 }
 
 func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatRequest, *types.OpenAIErrorWithStatusCode) {
@@ -893,7 +853,7 @@ func (h *GeminiStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 		return
 	}
 
-	RememberSignatures(geminiResponse.Candidates)
+	preserveFunctionCallSignatures(h.signatureScope, geminiResponse.Candidates)
 
 	h.convertToOpenaiStream(&geminiResponse, dataChan)
 
@@ -916,41 +876,48 @@ func (h *GeminiStreamHandler) convertToOpenaiStream(geminiResponse *GeminiChatRe
 
 	choices := make([]types.ChatCompletionStreamChoice, 0, len(geminiResponse.Candidates))
 
-	isStop := false
+	if h.toolIndices == nil {
+		h.toolIndices = make(map[int]int)
+		h.toolUsed = make(map[int]bool)
+	}
+	var finalChoices []types.ChatCompletionStreamChoice
 	for _, candidate := range geminiResponse.Candidates {
-		if candidate.FinishReason != nil && *candidate.FinishReason == "STOP" {
-			isStop = true
-			candidate.FinishReason = nil
+		choice := candidate.ToOpenAIStreamChoice(h.Request)
+		for _, tool := range choice.Delta.ToolCalls {
+			tool.Index = h.toolIndices[choice.Index]
+			h.toolIndices[choice.Index]++
+			h.toolUsed[choice.Index] = true
 		}
-		choices = append(choices, candidate.ToOpenAIStreamChoice(h.Request))
+		if choice.Delta.FunctionCall != nil {
+			h.toolUsed[choice.Index] = true
+		}
+		// A complete functionCall is a valid OpenAI delta. Keep its occurrence
+		// ID/index across the emitted event; finish only when Gemini finishes,
+		// not after each tool or with an extra contradictory "stop" event.
+		choice.FinishReason = ""
+		choices = append(choices, choice)
+		if candidate.FinishReason != nil {
+			finish := ConvertFinishReason(*candidate.FinishReason)
+			if *candidate.FinishReason == "STOP" && h.toolUsed[choice.Index] {
+				finish = types.FinishReasonToolCalls
+				if h.Request.Functions != nil {
+					finish = types.FinishReasonFunctionCall
+				}
+			}
+			finalChoices = append(finalChoices, types.ChatCompletionStreamChoice{
+				Index: choice.Index, FinishReason: finish,
+				Delta: types.ChatCompletionStreamChoiceDelta{},
+			})
+		}
 	}
 	// 累积流式内容到 TextBuilder，用于 UsageMetadata 缺失或不准确时的 token 计算备用（见 billingPartsText）。
 	h.Usage.TextBuilder.WriteString(BillingPartsText(geminiResponse.Candidates))
-
-	if len(choices) > 0 && (choices[0].Delta.ToolCalls != nil || choices[0].Delta.FunctionCall != nil) {
-		choices := choices[0].ConvertOpenaiStream()
-		for _, choice := range choices {
-			chatCompletionCopy := streamResponse
-			chatCompletionCopy.Choices = []types.ChatCompletionStreamChoice{choice}
-			responseBody, _ := json.Marshal(chatCompletionCopy)
-			dataChan <- string(responseBody)
-		}
-	} else {
-		streamResponse.Choices = choices
-		responseBody, _ := json.Marshal(streamResponse)
-		dataChan <- string(responseBody)
-	}
-
-	if isStop {
-		streamResponse.Choices = []types.ChatCompletionStreamChoice{
-			{
-				FinishReason: types.FinishReasonStop,
-				Delta: types.ChatCompletionStreamChoiceDelta{
-					Role: types.ChatMessageRoleAssistant,
-				},
-			},
-		}
-		responseBody, _ := json.Marshal(streamResponse)
+	streamResponse.Choices = choices
+	responseBody, _ := json.Marshal(streamResponse)
+	dataChan <- string(responseBody)
+	if len(finalChoices) > 0 {
+		streamResponse.Choices = finalChoices
+		responseBody, _ = json.Marshal(streamResponse)
 		dataChan <- string(responseBody)
 	}
 

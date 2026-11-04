@@ -205,6 +205,10 @@ type GeminiFunctionCall struct {
 	Name string                 `json:"name,omitempty"`
 	Args map[string]interface{} `json:"args,omitempty"`
 	Id   string                 `json:"id,omitempty"`
+
+	// Keep the upstream ID intact for native responses. OpenAI conversion uses a
+	// unique occurrence ID linked to the signature before exposing it to clients.
+	clientID string
 }
 
 func (candidate *GeminiChatCandidate) ToOpenAIStreamChoice(request *types.ChatCompletionRequest) types.ChatCompletionStreamChoice {
@@ -425,9 +429,13 @@ type GeminiFunctionResponseContent struct {
 
 func (g *GeminiFunctionCall) ToOpenAITool() *types.ChatCompletionToolCalls {
 	args, _ := json.Marshal(g.Args)
+	callID := g.clientID
+	if callID == "" {
+		callID = "call_" + utils.GetRandomString(24)
+	}
 
 	return &types.ChatCompletionToolCalls{
-		Id:    "call_" + utils.GetRandomString(24),
+		Id:    callID,
 		Type:  types.ChatMessageRoleFunction,
 		Index: 0,
 		Function: &types.ChatCompletionToolCallsFunction{

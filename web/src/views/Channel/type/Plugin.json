@@ -172,6 +172,18 @@
     }
   },
   "25": {
+    "gemini_signature_autofill": {
+      "name": "缺失思考签名兼容",
+      "description": "工具调用的真实 thoughtSignature 自动按调用 ID 缓存并回传。仅当已确认上游接受跳过校验标记时启用此兜底；缓存丢失、跨客户端历史或重启后可能丢失原思考链。已有签名保持不变。仅原生 Gemini 转换路径生效。",
+      "params": {
+        "enable": {
+          "name": "启用缺签名兜底",
+          "description": "缺少可恢复签名时才使用 skip_thought_signature_validator；默认关闭，不影响其他渠道。",
+          "type": "bool",
+          "required": true
+        }
+      }
+    },
     "code_execution": {
       "name": "代码执行",
       "description": "使用代码执行功能，开启后，计算tokens不准确，建议个人使用开启",

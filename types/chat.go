@@ -448,8 +448,8 @@ func (f *ChatCompletionToolCallsFunction) Split(c *ChatCompletionStreamChoice, s
 				Function: function,
 			}
 
-			if fIndex == 0 {
-				toolCalls.Id = c.Delta.ToolCalls[0].Id
+			if fIndex == 0 && index < len(c.Delta.ToolCalls) && c.Delta.ToolCalls[index] != nil {
+				toolCalls.Id = c.Delta.ToolCalls[index].Id
 			}
 			choice.Delta.ToolCalls = []*ChatCompletionToolCalls{toolCalls}
 		}
