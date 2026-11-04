@@ -125,10 +125,9 @@ func (stream *streamReader[T]) handleLine(rawLine []byte, readErr error) (stop b
 	return false
 }
 
-// processLinesWithIdleTimeout 带空闲超时的读循环：ReadBytes 是阻塞读，故放到独立
-// goroutine 中，主循环用 select 监听数据到达与空闲计时。计时器在收到首个 chunk 后
-// 才武装（保护长首字延迟的推理模型），之后每收到数据即重置；空闲超过阈值则主动关闭
-// response body 解除读 goroutine 阻塞，并向 ErrChan 投递超时错误。
+// processLinesWithIdleTimeout bounds both post-header first-data wait and gaps
+// between upstream chunks. Downstream heartbeat traffic does not reset it.
+// Closing the body unblocks the owned reader on every timeout/close path.
 func (stream *streamReader[T]) processLinesWithIdleTimeout() {
 	type readResult struct {
 		line []byte
@@ -154,12 +153,9 @@ func (stream *streamReader[T]) processLinesWithIdleTimeout() {
 		}
 	})
 
-	// 计时器创建后先停掉、不武装：首字节到达前的上游静默不计入空闲（保护长首字
-	// 延迟的推理模型），收到首个 chunk 后由 lineCh 分支 Reset 才真正开始计时。
+	// The header phase has its own limit. Once headers are received even an
+	// upstream that sends no chunks must time out instead of hanging forever.
 	idle := time.NewTimer(streamIdleTimeout)
-	if !idle.Stop() {
-		<-idle.C
-	}
 	defer idle.Stop()
 
 	for {

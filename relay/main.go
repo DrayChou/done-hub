@@ -40,7 +40,23 @@ func Relay(c *gin.Context) {
 	applyPreMappingBeforeRequest(c)
 
 	if err := relay.setRequest(); err != nil {
-		openaiErr := common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
+		if c.GetString("request_failure_stage") == "" {
+			c.Set("request_failure_stage", "request_validation")
+		}
+		if c.Request.Context().Err() != nil {
+			c.Set("client_disconnected", true)
+			c.Set("relay_error_code", "client_disconnected")
+			c.Status(499)
+			return
+		}
+		message := "invalid request body"
+		if c.GetString("request_failure_stage") == "ingress_read" {
+			message = "request body was interrupted before completion"
+		} else if c.GetString("request_failure_stage") == "request_validation" {
+			message = err.Error()
+		}
+		openaiErr := common.StringErrorWrapperLocal(message, "invalid_request_body", http.StatusBadRequest)
+		c.Set("relay_error_code", openaiErr.Code)
 		relay.HandleJsonError(openaiErr)
 		return
 	}
@@ -116,12 +132,16 @@ func Relay(c *gin.Context) {
 		// 冻结通道并记录是否应用了冷却
 		cooldownApplied := shouldCooldowns(c, channel, apiErr)
 
+		if c.Request.Context().Err() != nil {
+			apiErr = common.StringErrorWrapperLocal("client disconnected", "client_disconnected", 499)
+			breakReason = "client_disconnected"
+			break
+		}
 		if time.Since(startTime) > timeout {
 			logger.LogError(c.Request.Context(), fmt.Sprintf("retry_timeout model=%s channel_id=%d elapsed_time=%.2fs timeout=%.2fs",
 				modelName, channel.Id, time.Since(startTime).Seconds(), timeout.Seconds()))
-			// UpstreamUnavailableError 让 FilterOpenAIErr 坍缩为 503 + 统一文案，与"无可用渠道"出口对齐。
-			// 原 message 保留供 retry_aborted 日志诊断。
-			apiErr = common.UpstreamUnavailableError("重试超时，上游负载已饱和，请稍后再试")
+			// Do not turn a precise timeout/cancellation into a fictional load
+			// saturation error. Retry budget limits extra work, not diagnostics.
 			breakReason = "timeout"
 			break
 		}
@@ -191,11 +211,22 @@ func Relay(c *gin.Context) {
 			c.Set("channel_type", channel.Type)
 		}
 
-		if heartbeat != nil && heartbeat.IsSafeWriteStream() {
+		if heartbeat != nil {
+			heartbeat.Stop()
+		}
+		c.Set("relay_error_code", apiErr.Code)
+		if c.Request.Context().Err() != nil || c.GetBool("client_disconnected") {
+			c.Set("client_disconnected", true)
+			return
+		}
+		if c.GetBool("stream_terminal_sent") {
+			return
+		}
+		if relay.IsStream() && c.Writer.Written() {
+			c.Set("stream_failed", true)
 			relay.HandleStreamError(apiErr)
 			return
 		}
-
 		relay.HandleJsonError(apiErr)
 	}
 }
@@ -254,7 +285,9 @@ func checkPromptTokenLimit(relay RelayBaseInterface, promptTokens int) *types.Op
 }
 
 func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {
+	countStart := time.Now()
 	promptTokens, tonkeErr := relay.getPromptTokens()
+	relay.getContext().Set("prompt_count_ms", time.Since(countStart).Milliseconds())
 	if tonkeErr != nil {
 		err = common.ErrorWrapperLocal(tonkeErr, "token_error", http.StatusBadRequest)
 		done = true
@@ -287,7 +320,9 @@ func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCod
 	relay.getContext().Set(config.GinUpstreamRequestIdKey, "")
 	relay.getContext().Set(config.GinPassThroughHeaders, nil)
 
+	sendStart := time.Now()
 	err, done = relay.send()
+	relay.getContext().Set("provider_send_ms", time.Since(sendStart).Milliseconds())
 	// 最后处理流式中断时计算tokens
 	if usage.CompletionTokens == 0 && usage.TextBuilder.Len() > 0 {
 		usage.CompletionTokens = common.CountTokenText(usage.TextBuilder.String(), relay.getModelName())

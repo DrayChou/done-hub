@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
@@ -19,6 +20,11 @@ import (
 // readBody 读取请求体，使用读穿缓存保证全链路只读一次 c.Request.Body
 // 首次调用从 HTTP 流读取并缓存到 GinRequestBodyKey；后续调用直接返回缓存
 func readBody(c *gin.Context) ([]byte, error) {
+	if previous, ok := c.Get("request_body_read_error"); ok {
+		if err, ok := previous.(error); ok {
+			return nil, err
+		}
+	}
 	if cached, exists := c.Get(config.GinRequestBodyKey); exists {
 		if data, ok := cached.([]byte); ok && data != nil {
 			return data, nil
@@ -37,10 +43,18 @@ func readBody(c *gin.Context) ([]byte, error) {
 		size = 512
 	}
 	buf := bytes.NewBuffer(make([]byte, 0, size))
-	if _, err := buf.ReadFrom(c.Request.Body); err != nil {
+	started := time.Now()
+	n, err := buf.ReadFrom(c.Request.Body)
+	_ = c.Request.Body.Close()
+	c.Set("request_body_bytes", n)
+	c.Set("request_body_read_ms", time.Since(started).Milliseconds())
+	if err != nil {
+		// Pre-mapping and setRequest share this one read, including its failure.
+		// Never reread a partial/closed upload and replace the real error with EOF.
+		c.Set("request_body_read_error", err)
+		c.Set("request_failure_stage", "ingress_read")
 		return nil, err
 	}
-	c.Request.Body.Close()
 
 	data := buf.Bytes()
 	c.Set(config.GinRequestBodyKey, data)
@@ -63,6 +77,7 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 	contentType := c.ContentType()
 	if contentType == "" || strings.Contains(contentType, "json") {
 		if err = json.Unmarshal(requestBody, v); err != nil {
+			c.Set("request_failure_stage", "ingress_json")
 			return err
 		}
 		if err = binding.Validator.ValidateStruct(v); err != nil {

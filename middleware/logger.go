@@ -56,6 +56,18 @@ func GinzapWithConfig() gin.HandlerFunc {
 			zap.Int("token_id", c.GetInt("token_id")),
 			zap.String("token_name", c.GetString("token_name")),
 			zap.Int("channel_id", c.GetInt("channel_id")),
+			// Transport status alone is not business success after SSE heartbeats.
+			zap.Any("relay_error_code", func() any { v, _ := c.Get("relay_error_code"); return v }()),
+			zap.Bool("client_disconnected", c.GetBool("client_disconnected")),
+			zap.String("failure_stage", c.GetString("request_failure_stage")),
+			zap.Int64("content_length", c.Request.ContentLength),
+			zap.Int64("body_read_bytes", c.GetInt64("request_body_bytes")),
+			zap.Int64("body_read_ms", c.GetInt64("request_body_read_ms")),
+			zap.Int64("first_stream_data_ms", c.GetInt64("stream_first_data_ms")),
+			zap.Int64("prompt_count_ms", c.GetInt64("prompt_count_ms")),
+			zap.Int64("upstream_headers_ms", c.GetInt64("upstream_headers_ms")),
+			zap.Int64("provider_send_ms", c.GetInt64("provider_send_ms")),
+			zap.Bool("stream_failed", c.GetBool("stream_failed")),
 		}
 
 		if len(c.Errors) > 0 {

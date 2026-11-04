@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -162,7 +163,8 @@ func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		doneStr := func() string {
 			return ""
 		}
-		firstResponseTime := responseGeneralStreamClient(r.c, response, doneStr)
+		var firstResponseTime time.Time
+		firstResponseTime, err = responseGeneralStreamClient(r.c, response, doneStr)
 		r.SetFirstResponseTime(firstResponseTime)
 	} else {
 		var response *gemini.GeminiChatResponse

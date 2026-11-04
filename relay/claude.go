@@ -131,7 +131,8 @@ func (r *relayClaudeOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		doneStr := func() string {
 			return ""
 		}
-		firstResponseTime := responseGeneralStreamClient(r.c, response, doneStr)
+		var firstResponseTime time.Time
+		firstResponseTime, err = responseGeneralStreamClient(r.c, response, doneStr)
 		r.SetFirstResponseTime(firstResponseTime)
 	} else {
 		var response *claude.ClaudeResponse

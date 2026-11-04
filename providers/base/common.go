@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -279,6 +280,11 @@ func (p *BaseProvider) SetContext(c *gin.Context) {
 	// 这样即使客户端断开，上游请求也会继续完成，确保计费和日志正常记录
 	if c != nil && p.Requester != nil {
 		p.Requester.Context = context.WithoutCancel(c.Request.Context())
+		if c.GetBool("is_stream") {
+			// Before headers there is no returned output to settle. Cancel that
+			// wait on disconnect; after headers keep the existing usage path.
+			p.Requester.HeaderWaitContext = c.Request.Context()
+		}
 		// 统一采集上游 request-id：所有经 Requester 收发的 provider 自动覆盖，
 		// 失败响应也在错误判定前采集（排障最需要）。
 		// 不走 Requester 的 SDK 直连路径（bedrock aws_client）自行采集，汇入同一 key。
@@ -293,6 +299,9 @@ func (p *BaseProvider) SetContext(c *gin.Context) {
 		// 前提：hook 挂在 Requester 实例上。provider 若在 SetContext 之后换掉 Requester
 		// （如 deepseek 的 claudeProvider 委托），必须重新 SetContext，否则该路径静默丢采集。
 		p.Requester.ResponseHook = func(resp *http.Response) {
+			if start := c.GetTime("requestStartTime"); !start.IsZero() {
+				c.Set("upstream_headers_ms", time.Since(start).Milliseconds())
+			}
 			if requestID := requester.ExtractUpstreamRequestID(resp.Header); requestID != "" {
 				c.Set(config.GinUpstreamRequestIdKey, requestID)
 			}

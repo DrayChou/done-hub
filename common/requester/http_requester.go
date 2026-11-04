@@ -25,6 +25,9 @@ type HTTPRequester struct {
 	ErrorHandler      HttpErrorHandler
 	proxyAddr         string
 	Context           context.Context
+	// Cancel header wait when a streaming client has gone away. Once headers
+	// arrive, preserve the existing bounded output/usage-settlement lifetime.
+	HeaderWaitContext context.Context
 	IsOpenAI          bool
 	// ResponseHook 在收到上游响应后、错误状态判定前调用（成功与失败响应都触发），
 	// 用于统一采集上游响应头（如 request-id）。为 nil 时跳过。
@@ -84,16 +87,18 @@ func (r *HTTPRequester) SendRequest(req *http.Request, response any, outputResp 
 		req = req.WithContext(ctx)
 	}
 
-	resp, err := HTTPClient.Do(req)
+	resp, err := r.doUntilHeaders(req)
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "http_request_failed", http.StatusInternalServerError)
+		return nil, requestTransportError(err)
 	}
 
 	if r.ResponseHook != nil {
 		r.ResponseHook(resp)
 	}
 
-	if !outputResp {
+	if !outputResp || response != nil {
+		// outputResp reads and replaces the body below. Close the original
+		// transport body/context as well, not just the in-memory replacement.
 		defer resp.Body.Close()
 	}
 
@@ -139,10 +144,9 @@ func (r *HTTPRequester) SendRequest(req *http.Request, response any, outputResp 
 
 // 发送请求 RAW
 func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-	// 发送请求
-	resp, err := HTTPClient.Do(req)
+	resp, err := r.doUntilHeaders(req)
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "http_request_failed", http.StatusInternalServerError)
+		return nil, requestTransportError(err)
 	}
 
 	if r.ResponseHook != nil {

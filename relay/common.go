@@ -15,6 +15,7 @@ import (
 	providersBase "done-hub/providers/base"
 	"done-hub/providers/claude"
 	"done-hub/providers/gemini"
+	"done-hub/relay/relay_util"
 	"done-hub/types"
 	"encoding/json"
 	"errors"
@@ -501,134 +502,163 @@ func responseJsonClient(c *gin.Context, data interface{}) *types.OpenAIErrorWith
 
 type StreamEndHandler func() string
 
-func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
-	requester.SetEventStreamHeaders(c)
-	// 指纹保真：透传上游响应头（OpenAI x-ratelimit-* 等）。必须在首次写入前设置。
-	applyPassThroughHeaders(c)
-	dataChan, errChan := stream.Recv()
-
-	done := make(chan struct{})
-	var finalErr *types.OpenAIErrorWithStatusCode
-
-	defer stream.Close()
-
-	var isFirstResponse bool
-	ctx := c.Request.Context()
-	clientDisconnected := false
-
-	go func() {
-		defer close(done)
-
-		ctxDone := ctx.Done()
-
-		// 安全写入：客户端断开后静默跳过
-		tryWrite := func(msg string) {
-			if !clientDisconnected {
-				c.Writer.Write([]byte(msg))
-				c.Writer.Flush()
-			}
-		}
-
-		for {
-			select {
-			case data, ok := <-dataChan:
-				if !ok {
-					return
-				}
-
-				if !isFirstResponse {
-					firstResponseTime = time.Now()
-					isFirstResponse = true
-				}
-
-				// 客户端断开后继续消费数据以确保计费准确，但不写入
-				tryWrite("data: " + data + "\n\n")
-
-			case err := <-errChan:
-				if !errors.Is(err, io.EOF) {
-					tryWrite("data: " + err.Error() + "\n\n")
-					finalErr = common.StringErrorWrapper(err.Error(), "stream_error", 900)
-					logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
-				} else {
-					if finalErr == nil && endHandler != nil {
-						if streamData := endHandler(); streamData != "" {
-							tryWrite("data: " + streamData + "\n\n")
-						}
-					}
-					tryWrite("data: [DONE]\n\n")
-				}
-				return
-
-			case <-ctxDone:
-				clientDisconnected = true
-				ctxDone = nil // 置 nil 后此 case 不再命中，避免 CPU 空转
-			}
-		}
-	}()
-
-	<-done
-	return firstResponseTime, finalErr
+func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (time.Time, *types.OpenAIErrorWithStatusCode) {
+	return relayResponseStream(c, stream, endHandler, true)
 }
 
-func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time) {
+func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (time.Time, *types.OpenAIErrorWithStatusCode) {
+	return relayResponseStream(c, stream, endHandler, false)
+}
+
+// The header-wait heartbeat must be joined before entry. From here the handler
+// owns all writes (data, heartbeat, terminal/error); no competing writer worker.
+func relayResponseStream(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, openAIFrames bool) (first time.Time, finalErr *types.OpenAIErrorWithStatusCode) {
 	requester.SetEventStreamHeaders(c)
-	// 指纹保真：透传上游响应头（Bedrock x-amzn-* / Claude anthropic-* 等）。必须在首次写入前设置。
 	applyPassThroughHeaders(c)
-	dataChan, errChan := stream.Recv()
-
-	done := make(chan struct{})
+	dataCh, errCh := stream.Recv()
 	defer stream.Close()
-
-	var isFirstResponse bool
-	ctx := c.Request.Context()
-	clientDisconnected := false
-
-	go func() {
-		defer close(done)
-
-		ctxDone := ctx.Done()
-
-		tryWrite := func(msg string) {
-			if !clientDisconnected {
-				fmt.Fprint(c.Writer, msg)
-				c.Writer.Flush()
-			}
-		}
-
-		for {
-			select {
-			case data, ok := <-dataChan:
-				if !ok {
-					return
-				}
-				if !isFirstResponse {
-					firstResponseTime = time.Now()
-					isFirstResponse = true
-				}
-				tryWrite(data)
-
-			case err := <-errChan:
-				if !errors.Is(err, io.EOF) {
-					tryWrite(err.Error())
-					logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
-				} else {
-					if endHandler != nil {
-						if streamData := endHandler(); streamData != "" {
-							tryWrite(streamData)
-						}
-					}
-				}
-				return
-
-			case <-ctxDone:
-				clientDisconnected = true
-				ctxDone = nil // 置 nil 后此 case 不再命中，避免 CPU 空转
-			}
+	defer func() {
+		if finalErr != nil {
+			c.Set("relay_error_code", finalErr.Code)
+			c.Set("stream_failed", true)
 		}
 	}()
+	var ticks <-chan time.Time
+	if interval, ok := c.Get("stream_heartbeat_interval"); ok {
+		if d, ok := interval.(time.Duration); ok && d > 0 {
+			ticker := time.NewTicker(d)
+			defer ticker.Stop()
+			ticks = ticker.C
+		}
+	}
+	ctxDone := c.Request.Context().Done()
+	disconnected := false
+	write := func(text string) {
+		if disconnected || c.Request.Context().Err() != nil {
+			disconnected = true
+			c.Set("client_disconnected", true)
+			finalErr = common.StringErrorWrapperLocal("client disconnected while receiving stream", "client_disconnected", 499)
+			return
+		}
+		control := http.NewResponseController(c.Writer)
+		_ = control.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_, err := io.WriteString(c.Writer, text)
+		if err == nil {
+			err = control.Flush()
+		}
+		_ = control.SetWriteDeadline(time.Time{})
+		if err != nil {
+			disconnected = true
+			c.Set("client_disconnected", true)
+			finalErr = common.StringErrorWrapperLocal("client disconnected while receiving stream", "client_disconnected", 499)
+		}
 
-	<-done
-	return firstResponseTime
+	}
+	finish := func() {
+		if c.Request.Context().Err() != nil {
+			disconnected = true
+			c.Set("client_disconnected", true)
+			finalErr = common.StringErrorWrapperLocal("client disconnected while receiving stream", "client_disconnected", 499)
+		}
+		if finalErr != nil || disconnected {
+			return
+		}
+		if first.IsZero() {
+			finalErr = common.StringErrorWrapperLocal("upstream stream ended before any data", "empty_upstream_stream", http.StatusBadGateway)
+			write(formatStreamError(c, finalErr, openAIFrames))
+			c.Set("stream_terminal_sent", true)
+			return
+		}
+		if endHandler != nil {
+			if tail := endHandler(); tail != "" {
+				if openAIFrames {
+					write("data: " + tail + "\n\n")
+				} else {
+					write(tail)
+				}
+			}
+		}
+		if openAIFrames {
+			write("data: [DONE]\n\n")
+		}
+		c.Set("stream_terminal_sent", true)
+	}
+	for dataCh != nil || errCh != nil {
+		select {
+		case data, ok := <-dataCh:
+			if !ok {
+				dataCh = nil
+				continue
+			}
+			if first.IsZero() {
+				first = time.Now()
+				if start := c.GetTime("requestStartTime"); !start.IsZero() {
+					c.Set("stream_first_data_ms", time.Since(start).Milliseconds())
+				}
+			}
+			if openAIFrames {
+				write("data: " + data + "\n\n")
+			} else {
+				write(data)
+			}
+		case err, ok := <-errCh:
+			if !ok {
+				errCh = nil
+				continue
+			}
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
+				finish()
+				return first, finalErr
+			}
+			finalErr = common.StringErrorWrapperLocal("upstream stream interrupted", "stream_interrupted", http.StatusBadGateway)
+			var upstreamErr *types.OpenAIError
+			if errors.As(err, &upstreamErr) {
+				finalErr.OpenAIError = *upstreamErr
+			} else if hint := common.SafeNetErrHint(err.Error()); hint != "" {
+				finalErr.Message += ": " + hint
+			}
+			write(formatStreamError(c, finalErr, openAIFrames))
+			c.Set("stream_terminal_sent", true)
+			logger.LogError(c.Request.Context(), fmt.Sprintf("stream_failed code=%v client_disconnected=%t", finalErr.Code, disconnected))
+			return first, finalErr
+		case <-ticks:
+			write(relay_util.HeartbeatStreamText)
+		case <-ctxDone:
+			disconnected = true
+			ctxDone = nil
+			ticks = nil
+			c.Set("client_disconnected", true)
+			finalErr = common.StringErrorWrapperLocal("client disconnected while receiving stream", "client_disconnected", 499)
+			// Preserve the existing post-header consumption/usage settlement path,
+			// but do not write, retry or mark delivery as successful after disconnect.
+		}
+	}
+	finish()
+	return first, finalErr
+}
+
+func formatStreamError(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, openAIFrames bool) string {
+	safeErr := FilterOpenAIErr(c, apiErr)
+	err := safeErr.OpenAIError
+	var payload any = types.OpenAIErrorResponse{Error: err}
+	prefix := ""
+	if !openAIFrames {
+		switch {
+		case strings.HasPrefix(c.Request.URL.Path, "/claude"):
+			payload = claude.OpenaiErrToClaudeErr(&safeErr).ClaudeError
+			prefix = "event: error\n"
+		case strings.HasPrefix(c.Request.URL.Path, "/gemini"):
+			payload = gemini.OpenaiErrToGeminiErr(&safeErr).GeminiErrorResponse
+		case strings.HasPrefix(c.Request.URL.Path, "/v1/responses"):
+			payload = gin.H{"type": "error", "code": err.Code, "message": err.Message, "param": nil}
+			prefix = "event: error\n"
+		}
+	}
+	raw, _ := json.Marshal(payload)
+	return prefix + "data: " + string(raw) + "\n\n"
 }
 
 func responseMultipart(c *gin.Context, resp *http.Response) *types.OpenAIErrorWithStatusCode {

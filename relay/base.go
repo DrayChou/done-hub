@@ -143,10 +143,15 @@ func (r *relayBase) SetHeartbeat(isStream bool) *relay_util.Heartbeat {
 	}
 
 	tokenSetting, ok := setting.(*model.TokenSetting)
-	if !ok || !tokenSetting.Heartbeat.Enabled {
+	if !ok || tokenSetting == nil || !tokenSetting.Heartbeat.Enabled {
 		return nil
 	}
 
+	if isStream {
+		// The response loop reuses this opt-in after Stop joins the header-wait
+		// heartbeat, so only one goroutine ever owns the response writer.
+		r.c.Set("stream_heartbeat_interval", 5*time.Second)
+	}
 	r.heartbeat = relay_util.NewHeartbeat(
 		isStream,
 		relay_util.HeartbeatConfig{

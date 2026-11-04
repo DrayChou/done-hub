@@ -9,6 +9,7 @@ import (
 	"done-hub/types"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -104,8 +105,10 @@ func (r *relayImageEdits) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		doneStr := func() string {
 			return ""
 		}
-		firstResponseTime := responseGeneralStreamClient(r.c, stream, doneStr)
+		var firstResponseTime time.Time
+		firstResponseTime, err = responseGeneralStreamClient(r.c, stream, doneStr)
 		r.SetFirstResponseTime(firstResponseTime)
+		done = err != nil
 		return
 	}
 
