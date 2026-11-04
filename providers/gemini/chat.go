@@ -8,7 +8,9 @@ import (
 	"done-hub/common/utils"
 	"done-hub/providers/base"
 	"done-hub/types"
+	"done-hub/common/logger"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -54,6 +56,8 @@ func (p *GeminiProvider) CreateChatCompletion(request *types.ChatCompletionReque
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
+
+	RememberSignatures(geminiChatResponse.Candidates)
 
 	return ConvertToChatOpenai(p, geminiChatResponse, request)
 }
@@ -105,6 +109,12 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 		headers["Accept"] = "text/event-stream"
 	}
 
+	if !isRelay && SignatureAutofillEnabled(p.GetChannel()) {
+		if filled := FillSignaturesInRequest(geminiRequest); filled > 0 {
+			logger.SysLog(fmt.Sprintf("[Gemini] filled %d thoughtSignature(s) for channel %d", filled, p.GetChannel().Id))
+		}
+	}
+
 	if isRelay {
 		// 字节级路径：优先使用已清理的字节缓存，避免对含 base64 的大请求做 json.Unmarshal/Marshal
 		// 接受任意 variant（Gemini 或 VertexAI cleaned），因为 VertexAI 清理是 Gemini 的超集，
@@ -123,6 +133,12 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 			cleaned, err := CleanGeminiRequestBytes(rawData, false)
 			if err != nil {
 				return nil, common.ErrorWrapper(err, "clean_gemini_request_bytes_failed", http.StatusInternalServerError)
+			}
+			if SignatureAutofillEnabled(p.GetChannel()) {
+				if filled, count := InjectMissingSignatures(cleaned); count > 0 {
+					cleaned = filled
+					logger.SysLog(fmt.Sprintf("[Gemini] filled %d thoughtSignature(s) for channel %d", count, p.GetChannel().Id))
+				}
 			}
 			p.SetProcessedBodyBytes(cleaned, false)
 			req, errWithCode := p.NewRequestWithCustomParamsBytes(http.MethodPost, fullRequestURL, cleaned, headers, geminiRequest.Model)
@@ -471,11 +487,29 @@ func validateAndFixFunctionCallSequence(contents []interface{}) []interface{} {
 }
 
 // cleanSchemaRecursively 递归清理 schema 对象中的 $schema 和 additionalProperties 字段
+// geminiUnsupportedSchemaKeys 是 Gemini functionDeclarations.parameters 不接受、
+// 但 OpenAI 生态（Pi / Claude Code / 各类 SDK）普遍会带的 JSON Schema 关键字。
+// 上游命中任意一个都返回 400 Parameter validation error，必须在转换时剥掉。
+//
+// 依据 2026-11 对 apimodel.net 的实测：patternProperties / $schema / $ref / $defs /
+// const / examples / deprecated 会导致 400；additionalProperties / anyOf / oneOf /
+// format / minLength / maximum / default / title 可以正常通过。
+var geminiUnsupportedSchemaKeys = []string{
+	"patternProperties",
+	"$schema", "$ref", "$defs", "definitions", "$comment", "$id", "$anchor",
+	"const", "examples", "deprecated",
+	"if", "then", "else", "not", "propertyNames",
+	"unevaluatedProperties", "unevaluatedItems",
+	"dependencies", "dependentSchemas", "dependentRequired",
+}
+
 func cleanSchemaRecursively(obj interface{}) {
 	switch v := obj.(type) {
 	case map[string]interface{}:
 		// 删除 Gemini API 不支持的字段
-		delete(v, "$schema")
+		for _, key := range geminiUnsupportedSchemaKeys {
+			delete(v, key)
+		}
 		delete(v, "additionalProperties")
 
 		// 递归处理所有值
@@ -858,6 +892,8 @@ func (h *GeminiStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 		errChan <- aiError
 		return
 	}
+
+	RememberSignatures(geminiResponse.Candidates)
 
 	h.convertToOpenaiStream(&geminiResponse, dataChan)
 
