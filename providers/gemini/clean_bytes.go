@@ -56,18 +56,20 @@ const ThoughtSignatureInvalidMsg = "thought signature is not valid"
 //
 // 这些文案语义同类——客户端 history 携带的签名在当前 channel/account 上无法校验——
 // 补救手段也一致：ReplaceThoughtSignaturesBytes 把签名换成官方哨兵
-// skip_thought_signature_validator 后换渠道重试一次，因此不需要按文案区分处理。
+// skip_thought_signature_validator。GeminiProvider 在同凭据内补救一次；其他
+// 原生 provider 沿用各自的重试策略，因此不需要按文案区分处理。
 //   - "thought signature is not valid" : 原 channel 签发的签名在新 channel/key 上无法识别
 //   - "corrupted thought signature"    : 签名字节损坏/截断（2026-07 起在多 key 渠道高频出现）
 //   - "thought_signature is invalid"   : snake_case 变体，防御性纳入
 var thoughtSignatureFailureSignals = []string{
 	ThoughtSignatureInvalidMsg,
+	"invalid thought signature",
 	"corrupted thought signature",
 	"thought_signature is invalid",
 }
 
 // IsThoughtSignatureFailure 判断上游 message 是否属于"thoughtSignature 不可用"这一类
-// 可通过"剥签名换哨兵 + 换渠道重试"补救的错误。message 传原文即可，函数内部做 ToLower。
+// 可用兼容哨兵尝试补救的错误。message 传原文即可，函数内部做 ToLower。
 func IsThoughtSignatureFailure(message string) bool {
 	msg := strings.ToLower(message)
 	for _, signal := range thoughtSignatureFailureSignals {
@@ -78,49 +80,39 @@ func IsThoughtSignatureFailure(message string) bool {
 	return false
 }
 
-// ReplaceThoughtSignaturesBytes 在字节层面把请求中所有 thoughtSignature 字段
-// 替换为 SkipThoughtSignatureValidator 哨兵字符串。
+// ReplaceThoughtSignaturesBytes 只替换 model parts 中的 thoughtSignature / thought_signature，
+// 不触碰 user/tool 结果、工具参数里的同名字段或其它请求数据。
 //
 // 使用 gjson 找到所有匹配路径、sjson 批量替换，零反序列化、对含 base64 图片的
 // 大 body 同样安全。
 //
-// 仅应在 retry 时调用：首次请求必须完整透传客户端给出的签名，否则会主动降级
+// 仅在明确签名校验失败后的受限补救中调用：首次必须保留真实签名，不能主动降级
 // 所有用户的 thinking 体验。
 //
-// 返回值：替换后的 bytes，以及实际替换的字段数量（0 表示请求里本来就没有
-// thoughtSignature，此时调用方可跳过后续逻辑）。
+// 返回值：替换后的 bytes，以及实际替换的字段数量；无法安全替换时保留原文，不重发。
 func ReplaceThoughtSignaturesBytes(data []byte) ([]byte, int) {
-	if len(data) == 0 {
+	if !gjson.ValidBytes(data) {
 		return data, 0
 	}
 
-	contents := gjson.GetBytes(data, "contents")
-	if !contents.Exists() {
-		return data, 0
-	}
-
+	original := data
 	replaced := 0
-	for i, content := range contents.Array() {
-		parts := content.Get("parts")
-		if !parts.Exists() {
+	for i, content := range gjson.GetBytes(data, "contents").Array() {
+		if content.Get("role").String() != "model" {
 			continue
 		}
-		for j, part := range parts.Array() {
-			sig := part.Get("thoughtSignature")
-			if !sig.Exists() {
-				continue
-			}
-			// 已经是哨兵则跳过，避免二次调用时 replaced 数字虚高、混淆日志。
-			// 这一情况只可能出现在调用方在同一请求生命周期内多次调用本函数；
-			// retry 链路里 shouldRetryBadRequest 通过 thought_signature_retried
-			// 标志保证最多调一次，所以这是防御性的——但比"靠 retried 标志间接保证"
-			// 更稳，本函数自身是幂等的。
-			if sig.Type == gjson.String && sig.String() == SkipThoughtSignatureValidator {
-				continue
-			}
-			path := fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", i, j)
-			if newData, err := sjson.SetBytes(data, path, SkipThoughtSignatureValidator); err == nil {
-				data = newData
+		for j, part := range content.Get("parts").Array() {
+			for _, field := range []string{"thoughtSignature", "thought_signature"} {
+				sig := part.Get(field)
+				if !sig.Exists() || sig.Type != gjson.String || sig.String() == "" || sig.String() == SkipThoughtSignatureValidator {
+					continue
+				}
+				path := fmt.Sprintf("contents.%d.parts.%d.%s", i, j, field)
+				updated, err := sjson.SetBytes(data, path, SkipThoughtSignatureValidator)
+				if err != nil {
+					return original, 0
+				}
+				data = updated
 				replaced++
 			}
 		}

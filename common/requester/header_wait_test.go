@@ -77,6 +77,27 @@ func TestHeaderWaitCancellationAndPostHeaderSettlement(t *testing.T) {
 	}
 }
 
+func TestRequestTimeoutUsesExistingBudgets(t *testing.T) {
+	originalClient, originalRequestTimeout := HTTPClient, relayRequestTimeout
+	defer func() { HTTPClient, relayRequestTimeout = originalClient, originalRequestTimeout }()
+	for _, tt := range []struct {
+		total, request time.Duration
+		stream         bool
+		want           time.Duration
+	}{
+		{600 * time.Second, 300 * time.Second, true, 600 * time.Second},
+		{600 * time.Second, 300 * time.Second, false, 300 * time.Second},
+		{5 * time.Second, 300 * time.Second, false, 5 * time.Second},
+		{0, 300 * time.Second, false, 300 * time.Second},
+		{0, 300 * time.Second, true, 0},
+	} {
+		HTTPClient, relayRequestTimeout = &http.Client{Timeout: tt.total}, tt.request
+		if got := RequestTimeout(tt.stream); got != tt.want {
+			t.Fatalf("total=%s request=%s stream=%t got=%s want=%s", tt.total, tt.request, tt.stream, got, tt.want)
+		}
+	}
+}
+
 func TestStreamFirstDataWaitIsBounded(t *testing.T) {
 	original := streamIdleTimeout
 	streamIdleTimeout = 30 * time.Millisecond

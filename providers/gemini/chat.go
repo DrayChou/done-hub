@@ -53,7 +53,7 @@ func (p *GeminiProvider) CreateChatCompletion(request *types.ChatCompletionReque
 
 	geminiChatResponse := &GeminiChatResponse{}
 	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, geminiChatResponse, false)
+	_, errWithCode = p.sendWithSignatureRepair(req, geminiChatResponse, false)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -82,7 +82,7 @@ func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	resp, errWithCode := p.sendWithSignatureRepair(req, nil, true)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}

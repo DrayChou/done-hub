@@ -49,7 +49,7 @@ func (p *GeminiProvider) CreateGeminiChat(request *GeminiChatRequest) (*GeminiCh
 
 	geminiResponse := &GeminiChatResponse{}
 	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, geminiResponse, false)
+	_, errWithCode = p.sendWithSignatureRepair(req, geminiResponse, false)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -111,7 +111,7 @@ func (p *GeminiProvider) CreateGeminiChatStream(request *GeminiChatRequest) (req
 	}
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	resp, errWithCode := p.sendWithSignatureRepair(req, nil, true)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}

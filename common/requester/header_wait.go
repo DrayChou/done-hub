@@ -39,8 +39,15 @@ func (r *HTTPRequester) doUntilHeaders(req *http.Request) (*http.Response, error
 		cancel()
 		return nil, err
 	}
-	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	resp.Body = WithCancelOnClose(resp.Body, cancel)
 	return resp, nil
+}
+
+// WithCancelOnClose transfers a request context's lifetime to its response body.
+// Providers that share a deadline across corrective sends must not cancel a
+// successful stream before its consumer finishes reading and settling usage.
+func WithCancelOnClose(body io.ReadCloser, cancel context.CancelFunc) io.ReadCloser {
+	return &cancelOnCloseBody{ReadCloser: body, cancel: cancel}
 }
 
 type cancelOnCloseBody struct {

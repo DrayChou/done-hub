@@ -12,6 +12,17 @@ import (
 var HTTPClient *http.Client
 var relayRequestTimeout time.Duration
 
+// RequestTimeout returns the existing wall-clock budget for one logical request.
+// A provider making a corrective resend must share it across both attempts rather
+// than renewing HTTPClient.Timeout or the non-streaming timeout on the second send.
+func RequestTimeout(stream bool) time.Duration {
+	timeout := HTTPClient.Timeout
+	if !stream && relayRequestTimeout > 0 && (timeout <= 0 || relayRequestTimeout < timeout) {
+		timeout = relayRequestTimeout
+	}
+	return timeout
+}
+
 // streamIdleTimeout 流式空闲超时：每收到一段数据就重置，上游静默超过该时长即中止。
 // 与墙钟总超时（HTTPClient.Timeout）互补——墙钟是硬总封顶，本值精准处理"卡死流"。
 // 设为 0 禁用（回到旧的纯阻塞读行为）。

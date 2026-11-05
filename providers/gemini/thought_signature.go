@@ -2,10 +2,13 @@ package gemini
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"done-hub/common"
 	"done-hub/common/cache"
+	"done-hub/common/config"
 	"done-hub/common/logger"
+	"done-hub/common/requester"
 	"done-hub/common/utils"
 	"done-hub/model"
 	"done-hub/types"
@@ -168,4 +171,87 @@ func (p *GeminiProvider) prepareThoughtSignatures(req *http.Request) *types.Open
 		logger.SysLog(fmt.Sprintf("[Gemini] signatures restored=%d fallback=%d channel=%d", restored, fallback, p.GetChannel().Id))
 	}
 	return nil
+}
+
+// sendWithSignatureRepair owns the final native HTTP exchange for both Chat
+// conversion and Gemini-native callers. A rejected signature may be replaced
+// once, on this request only, without channel selection, re-conversion or cache
+// mutation. HTTP 200 streams are handed off immediately and are never replayed.
+func (p *GeminiProvider) sendWithSignatureRepair(req *http.Request, response any, stream bool) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	send := func(r *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+		if stream {
+			return p.Requester.SendRequestRaw(r)
+		}
+		return p.Requester.SendRequest(r, response, false)
+	}
+	if !SignatureAutofillEnabled(p.GetChannel()) {
+		return send(req)
+	}
+
+	// Reuse the existing budget, shared by both sends and the successful body.
+	// Non-streaming SendRequest must not start a new independent budget per try.
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout := requester.RequestTimeout(stream); timeout > 0 {
+		ctx, cancel = context.WithTimeout(req.Context(), timeout)
+	} else {
+		ctx, cancel = context.WithCancel(req.Context())
+	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
+	req = req.WithContext(ctx)
+	if p.Context != nil && p.Context.Request != nil {
+		// Until headers arrive no output needs post-disconnect settlement, even
+		// for a non-streaming corrective send. The requester already detaches
+		// this cancellation once it hands the response body to the consumer.
+		p.Requester.HeaderWaitContext = p.Context.Request.Context()
+	}
+
+	resp, apiErr := send(req)
+	if apiErr != nil && !apiErr.LocalError && apiErr.StatusCode == http.StatusBadRequest &&
+		IsThoughtSignatureFailure(apiErr.Message) && req.GetBody != nil && ctx.Err() == nil {
+		clientCancelled := p.Context != nil && p.Context.Request != nil && p.Context.Request.Context().Err() != nil
+		alreadyRetried := p.Context != nil && p.Context.GetBool("thought_signature_retried")
+		if !clientCancelled && !alreadyRetried {
+			body, err := req.GetBody()
+			if err != nil {
+				return resp, apiErr
+			}
+			data, readErr := io.ReadAll(body)
+			_ = body.Close()
+			if readErr != nil {
+				return resp, apiErr
+			}
+			repaired, count := ReplaceThoughtSignaturesBytes(data)
+			if count > 0 && ctx.Err() == nil && (p.Context == nil || p.Context.Request == nil || p.Context.Request.Context().Err() == nil) {
+				if p.Context != nil {
+					p.Context.Set("thought_signature_retried", true)
+					p.Context.Set(config.GinUpstreamRequestIdKey, "")
+					p.Context.Set(config.GinPassThroughHeaders, nil)
+					logger.LogWarn(ctx, fmt.Sprintf(
+						"gemini_signature_repair model=%s channel_id=%d replaced=%d attempt=2",
+						p.OriginalModel, p.GetChannel().Id, count))
+				}
+				retry := req.Clone(ctx)
+				retry.Body = io.NopCloser(bytes.NewReader(repaired))
+				defer retry.Body.Close()
+				retry.ContentLength = int64(len(repaired))
+				retry.Header.Del("Content-Length")
+				retry.TransferEncoding = nil
+				retry.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(repaired)), nil }
+				resp, apiErr = send(retry)
+			}
+		}
+	}
+
+	if apiErr == nil && stream {
+		// Transfer ownership before returning the asynchronous stream. Every
+		// success/error/timeout/cancel/Close path releases it via response.Body.
+		resp.Body = requester.WithCancelOnClose(resp.Body, cancel)
+		cancel = nil
+	}
+	return resp, apiErr
 }

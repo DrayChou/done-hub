@@ -267,6 +267,11 @@ func (r *relayGeminiOnly) handleCachedContentFailure(apiErr *types.OpenAIErrorWi
 // 本函数只负责改写 body；retry 决策与 thought_signature_retried 标志由
 // shouldRetryBadRequest 集中管理。
 func (r *relayGeminiOnly) handleThoughtSignatureFailure(apiErr *types.OpenAIErrorWithStatusCode) {
+	// GeminiProvider already repairs the final body on the same credential.
+	// Keep this legacy cross-channel handling only for the other native providers.
+	if r.provider != nil && r.provider.GetChannel().Type == config.ChannelTypeGemini {
+		return
+	}
 	if apiErr == nil || apiErr.StatusCode != http.StatusBadRequest {
 		return
 	}

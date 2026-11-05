@@ -132,6 +132,19 @@ func TestTimeoutErrorIsNotReclassifiedAsSaturation(t *testing.T) {
 	}
 }
 
+func TestGeminiSignatureRepairDoesNotUseGenericChannelRetry(t *testing.T) {
+	for _, repaired := range []bool{false, true} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		c.Set("thought_signature_retried", repaired)
+		apiErr := &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusBadRequest,
+			OpenAIError: types.OpenAIError{Message: "Invalid thought signature."}}
+		if shouldRetry(c, apiErr, config.ChannelTypeGemini) {
+			t.Fatal("Gemini signature failure escaped its provider's opt-in, bounded repair")
+		}
+	}
+}
+
 // A real chunked response can be truncated after headers. Its transport failure
 // must reach the stream error path; clean EOF and closed channels are not equivalent.
 func TestTruncatedUpstreamStreamProducesError(t *testing.T) {

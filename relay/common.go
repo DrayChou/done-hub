@@ -780,6 +780,12 @@ func shouldRetryBadRequest(c *gin.Context, channelType int, apiErr *types.OpenAI
 		//   - 即使没有 bytes 缓存（如不带签名的请求误命中），也不会因 handleX 走空路径
 		//     而漏置标志位、退化为无限重试
 		if gemini.IsThoughtSignatureFailure(apiErr.OpenAIError.Message) {
+			// Gemini's provider owns the opt-in, same-credential repair for both
+			// Chat and native endpoints. Do not bypass a disabled plugin or retry
+			// the same rejected history on a different channel after it returns.
+			if channelType == config.ChannelTypeGemini {
+				return false
+			}
 			if c.GetBool("thought_signature_retried") {
 				return false
 			}
