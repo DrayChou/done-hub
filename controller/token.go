@@ -541,8 +541,8 @@ func validateTokenSetting(setting *model.TokenSetting) error {
 	}
 
 	if setting.Heartbeat.Enabled {
-		if setting.Heartbeat.TimeoutSeconds < 30 || setting.Heartbeat.TimeoutSeconds > 90 {
-			return errors.New("heartbeat timeout seconds must be between 30 and 90")
+		if setting.Heartbeat.TimeoutSeconds < 5 || setting.Heartbeat.TimeoutSeconds > 90 {
+			return errors.New("heartbeat timeout seconds must be between 5 and 90")
 		}
 	}
 

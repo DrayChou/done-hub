@@ -836,7 +836,21 @@ func FilterOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) (errW
 		newErr = *err
 	}
 
-	// 客户端可见错误白名单：仅 400 透传上游原文（参数错误对客户端有意义），
+	// Preserve upstream timeout semantics without exposing its body, provider or
+	// credentials. A returned HTTP 504 is not evidence of capacity saturation;
+	// keep the same public category as the requester's local timeout diagnostic.
+	if !newErr.LocalError && newErr.StatusCode == http.StatusGatewayTimeout {
+		return types.OpenAIErrorWithStatusCode{
+			StatusCode: http.StatusGatewayTimeout,
+			OpenAIError: types.OpenAIError{
+				Type:    "upstream_error",
+				Code:    "upstream_timeout",
+				Message: utils.MessageWithRequestId("upstream timed out waiting for a response", c.GetString(logger.RequestIdKey)),
+			},
+		}
+	}
+
+	// 客户端可见错误白名单：400可透传参数诊断，504只返回上面的安全超时摘要；
 	// 其余统一坍缩为 503 + 固定文案，避免客户端通过 status code 或 message 差异
 	// 反推上游身份/key 状态/路径等内部信息。
 	// 坍缩范围：

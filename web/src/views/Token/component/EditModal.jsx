@@ -58,7 +58,7 @@ const validationSchema = Yup.object().shape({
       enabled: Yup.boolean(),
       timeout_seconds: Yup.number().when('enabled', {
         is: true,
-        then: () => Yup.number().min(30, '时间 必须大于等于30秒').max(90, '时间 必须小于等于90秒').required('时间 不能为空'),
+        then: () => Yup.number().min(5, '时间 必须大于等于5秒').max(90, '时间 必须小于等于90秒').required('时间 不能为空'),
         otherwise: () => Yup.number()
       })
     }),

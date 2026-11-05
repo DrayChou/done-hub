@@ -119,16 +119,26 @@ func TestStreamClosedChannelsAndDisconnect(t *testing.T) {
 }
 
 func TestTimeoutErrorIsNotReclassifiedAsSaturation(t *testing.T) {
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	apiErr := &types.OpenAIErrorWithStatusCode{LocalError: true, StatusCode: http.StatusGatewayTimeout,
-		OpenAIError: types.OpenAIError{Code: "upstream_timeout", Type: "one_hub_error", Message: "upstream timed out waiting for a response"}}
-	if shouldRetry(c, apiErr, config.ChannelTypeGemini) {
-		t.Fatal("timed out request silently retried")
-	}
-	formatted := formatStreamError(c, apiErr, true)
-	if !strings.Contains(formatted, "upstream_timeout") || strings.Contains(formatted, "service_unavailable") {
-		t.Fatalf("lost specific timeout: %s", formatted)
+	for _, local := range []bool{false, true} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		c.Set(logger.RequestIdKey, "synthetic-timeout-request")
+		apiErr := &types.OpenAIErrorWithStatusCode{LocalError: local, StatusCode: http.StatusGatewayTimeout,
+			OpenAIError: types.OpenAIError{Code: "upstream_timeout", Type: "one_hub_error", Message: "upstream timed out waiting for a response"}}
+		if local && shouldRetry(c, apiErr, config.ChannelTypeGemini) {
+			t.Fatal("locally timed out request silently retried")
+		}
+		if !local {
+			apiErr.OpenAIError = types.OpenAIError{Code: "bad_response_status_code", Type: "upstream_error", Message: "private-backend.invalid/private?api_key=credential-never-expose"}
+		}
+		safe := FilterOpenAIErr(c, apiErr)
+		formatted := formatStreamError(c, apiErr, true)
+		if safe.StatusCode != http.StatusGatewayTimeout || !strings.Contains(formatted, "upstream_timeout") || strings.Contains(formatted, "service_unavailable") || !strings.Contains(formatted, "synthetic-timeout-request") {
+			t.Fatalf("lost specific timeout: %+v %s", safe, formatted)
+		}
+		if !local && (strings.Contains(formatted, "private-backend") || strings.Contains(formatted, "credential-never-expose") || strings.Contains(formatted, "private?")) {
+			t.Fatalf("raw upstream timeout detail leaked: %s", formatted)
+		}
 	}
 }
 
