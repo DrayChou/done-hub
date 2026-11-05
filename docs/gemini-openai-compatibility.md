@@ -43,6 +43,19 @@ calls with unsigned parts may require this fallback. If the backend rejects the
 escape hatch, use a fresh history/native signature-preserving client or fix the
 upstream; do not silently strip semantic content.
 
+## Tool-result roles
+
+Converted OpenAI `tool`/legacy `function` results use Gemini-native **`role: "user"`**
+with `functionResponse` parts. Consecutive parallel results stay in one result turn,
+paired by call ID/name; plain user text is not merged into it. Replaying results as
+OpenAI's legacy `role: "function"` is not a valid assumption for Gemini streaming
+backends: the same signed synthetic history failed with that role and succeeded
+when only the result role was changed to `user`.
+
+Failed streaming endpoints can themselves return `data: {"detail": ...}` rather
+than an application/json error. The Gemini error handler extracts that known
+error envelope with the same redaction rules instead of losing the diagnostic.
+
 ## Tool schemas
 
 The normalizer visits schema positions only. A property named `const`, `$ref` or

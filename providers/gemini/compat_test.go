@@ -285,6 +285,7 @@ func TestGeminiGatewayErrorsRemainVisibleAndRedacted(t *testing.T) {
 	for _, tt := range []struct{ body, want string }{
 		{`{"detail":"Unknown name patternProperties; synthetic-secret synthetic-secret"}`, "Unknown name patternProperties"},
 		{`{"detail":[{"msg":"bad","input":"private payload"}]}`, "upstream parameter validation failed"},
+		{"data: {\"detail\":\"Parameter validation error synthetic-secret\",\"status\":\"FAILED\"}\n\n", "Parameter validation error"},
 		{`{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"missing signature"}}`, "missing signature"},
 		{`[{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"array error"}}]`, "array error"},
 	} {

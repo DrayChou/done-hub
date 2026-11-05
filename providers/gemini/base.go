@@ -158,6 +158,21 @@ func RequestErrorHandle(key string) requester.HttpErrorHandler {
 			return nil
 		}
 		resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		// A failed stream endpoint may still return `data: {detail: ...}`
+		// instead of an application/json body. Decode that error envelope too;
+		// never echo arbitrary stream/body bytes when no known error is found.
+		if !json.Valid(bodyBytes) {
+			for _, line := range bytes.Split(bodyBytes, []byte{'\n'}) {
+				line = bytes.TrimSpace(line)
+				if bytes.HasPrefix(line, []byte("data:")) {
+					candidate := bytes.TrimSpace(line[len("data:"):])
+					if json.Valid(candidate) {
+						bodyBytes = candidate
+						break
+					}
+				}
+			}
+		}
 
 		geminiError := &GeminiErrorResponse{}
 		if err := json.Unmarshal(bodyBytes, geminiError); err == nil && geminiError.ErrorInfo != nil {

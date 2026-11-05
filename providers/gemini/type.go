@@ -773,11 +773,15 @@ func OpenAIToGeminiChatContent(openaiContents []types.ChatCompletionMessage) ([]
 				},
 			}
 
-			if len(contents) > 0 && contents[len(contents)-1].Role == "function" {
+			// Gemini native results belong to a user turn, not OpenAI's legacy
+			// "function" role. Group consecutive parallel results, but never merge
+			// them into a preceding plain-text user turn.
+			if len(contents) > 0 && contents[len(contents)-1].Role == "user" &&
+				len(contents[len(contents)-1].Parts) > 0 && contents[len(contents)-1].Parts[0].FunctionResponse != nil {
 				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, functionPart)
 			} else {
 				contents = append(contents, GeminiChatContent{
-					Role:  "function",
+					Role:  "user",
 					Parts: []GeminiPart{functionPart},
 				})
 			}
