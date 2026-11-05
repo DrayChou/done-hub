@@ -162,7 +162,7 @@ func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *type
 }
 
 // 获取流式响应
-func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T]) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
+func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T], validateEOF ...func() error) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
 	// 如果返回的头是json格式 说明有错误
 	// if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
 	// 	return nil, HandleErrorResp(resp, requester.ErrorHandler, requester.IsOpenAI)
@@ -176,6 +176,9 @@ func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, 
 
 		DataChan: make(chan T),
 		ErrChan:  make(chan error),
+	}
+	if len(validateEOF) > 0 {
+		stream.validateEOF = validateEOF[0]
 	}
 
 	return stream, nil

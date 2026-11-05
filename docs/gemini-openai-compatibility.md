@@ -31,11 +31,25 @@ Gemini channel plugin **缺失思考签名兼容**:
 {"gemini_signature_autofill":{"enable":true}}
 ```
 
-This only inserts `skip_thought_signature_validator` when there is no recoverable
-signature. It is **off by default**. It is not a fabricated signature or a guarantee
-of preserved reasoning: bypassing validation may lose the original thinking
-state. Keep it off on unverified backends. Real signatures always take priority.
-The setting applies to the native Gemini conversion path, not `use_openai_api`.
+This inserts `skip_thought_signature_validator` when there is no recoverable
+signature. It is **off by default**. It also permits exactly one corrective resend
+when the final upstream HTTP request is rejected with a recognized signature
+validation **400**, including `Invalid thought signature`. The first send preserves
+real signatures; the resend replaces only signatures on model parts, uses the
+same URL/credential, and never mutates shared history/signature caches.
+
+Both sends share the existing request timeout budget; this does not enable global
+channel retries or extend timeouts. Client cancellation before response headers
+stops the exchange. Successful stream bodies own the remaining context until
+closed, preserving bounded output/usage settlement after headers. A stream that
+has already returned HTTP 200 is never replayed, including in-stream errors.
+A disabled plugin, unrelated error, missing replaceable signature or second
+rejection returns the error rather than repeating the request.
+
+This escape hatch is not a guarantee of preserved reasoning: bypassing validation
+may lose the original thinking state. Keep it off on unverified backends. It
+applies to the type-25 Gemini provider (Chat conversion and native Gemini), not
+`use_openai_api` or every provider that happens to embed Gemini helpers.
 No user message is injected and no tool result is removed to hide an error.
 
 Old histories from other clients/channels, cache eviction/restart and parallel
@@ -88,7 +102,9 @@ isolated database copy without a secondary proxy/fallback channel masking failur
 
 ## Scope
 
-This fix does not add a Chat-to-Responses bridge for GPT channels. GPT models whose
-upstream only supports function tools through Responses must still use that
-upstream-supported protocol. It also does not certify model identity/quality from
-third-party aliases or response-ID prefixes.
+GPT protocol selection is a separate capability: [multi-upstream compatibility](upstream-compatibility.md)
+describes the opt-in Chat-to-Responses bridge for OpenAI/custom channels, reusing
+the existing converter rather than introducing provider-specific model aliases.
+Neither feature certifies model identity/quality from third-party aliases or
+response-ID prefixes. A supported adapter does not prove a particular account
+has access to a model.

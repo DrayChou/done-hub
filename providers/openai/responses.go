@@ -9,6 +9,7 @@ import (
 	"done-hub/providers/base"
 	"done-hub/types"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -25,8 +26,10 @@ type OpenAIResponsesStreamHandler struct {
 	MessageID string
 	Context   *gin.Context
 
-	searchType string
-	toolIndex  int
+	searchType   string
+	toolIndices  map[string]int
+	chatTools    []responsesChatTool
+	chatTerminal bool
 
 	// SSE 事件缓冲
 	eventBuffer strings.Builder
@@ -57,6 +60,17 @@ func (p *OpenAIProvider) CreateResponses(request *types.OpenAIResponsesRequest) 
 
 	// 透传上游响应头（限流指纹等）：与字节透传解耦，成功响应即捕获。
 	p.storeOpenAIUpstreamHeaders(resp.Header)
+
+	if request.ConvertChat && (response.Error != nil || response.Status != types.ResponseStatusCompleted && response.Status != types.ResponseStatusIncomplete) {
+		if response.Usage != nil {
+			*p.Usage = *response.Usage.ToOpenAIUsage()
+		}
+		apiErr := &types.OpenAIError{Type: "upstream_error", Code: "response_failed", Message: "upstream Responses request failed"}
+		if response.Error != nil {
+			apiErr = response.Error
+		}
+		return nil, &types.OpenAIErrorWithStatusCode{OpenAIError: *apiErr, StatusCode: http.StatusBadGateway}
+	}
 
 	// 仅在 usage 完全缺失、或有响应内容却把 output_tokens 算成 0（解析异常）时才兜底估算，
 	// 避免误杀上游真实返回的空响应（output_tokens=0 且无内容是合法的）而覆盖其 input/details。
@@ -115,7 +129,7 @@ func (p *OpenAIProvider) CreateResponsesStream(request *types.OpenAIResponsesReq
 	}
 
 	if request.ConvertChat {
-		return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream)
+		return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream, chatHandler.ValidateChatEOF)
 	}
 
 	return requester.RequestNoTrimStream(p.Requester, resp, chatHandler.HandlerResponsesStream)
@@ -400,164 +414,225 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 	h.eventType = ""
 }
 
+type responsesChatTool struct {
+	arguments string
+	complete  bool
+}
+
+// ValidateChatEOF distinguishes transport completion from Responses completion.
+// It runs on the reader goroutine, after the final line and before EOF is sent.
+func (h *OpenAIResponsesStreamHandler) ValidateChatEOF() error {
+	if !h.chatTerminal {
+		return &types.OpenAIError{Type: "upstream_error", Code: "incomplete_upstream_stream", Message: "upstream Responses stream ended without a terminal event"}
+	}
+	return nil
+}
+
+func (h *OpenAIResponsesStreamHandler) chatToolIndex(event *types.OpenAIResponsesStreamResponses) (int, bool) {
+	index, ok := h.toolIndices["id:"+event.ItemID]
+	if !ok && event.Item != nil {
+		index, ok = h.toolIndices["id:"+event.Item.ID]
+	}
+	if !ok && event.OutputIndex != nil {
+		index, ok = h.toolIndices[fmt.Sprintf("index:%d", *event.OutputIndex)]
+	}
+	return index, ok
+}
+
+// A final arguments event is authoritative. Only append its unsent suffix;
+// conflicting/truncated JSON is an upstream failure, never an executable call.
+func (h *OpenAIResponsesStreamHandler) finishChatTool(index int, arguments string) (string, error) {
+	tool := &h.chatTools[index]
+	if !strings.HasPrefix(arguments, tool.arguments) || !validFunctionArguments(arguments) {
+		return "", &types.OpenAIError{Type: "upstream_error", Code: "invalid_tool_call", Message: "upstream function arguments are incomplete or conflict with streamed arguments"}
+	}
+	suffix := arguments[len(tool.arguments):]
+	tool.arguments, tool.complete = arguments, true
+	// Delta events were already counted; only final-only bytes need the same
+	// output-token fallback accounting when upstream omits usage.
+	h.Usage.TextBuilder.WriteString(suffix)
+	return suffix, nil
+}
+
+func validFunctionArguments(arguments string) bool {
+	trimmed := strings.TrimSpace(arguments)
+	return strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed))
+}
+
 func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	// 如果rawLine 前缀不为data:，则直接返回
-	if !strings.HasPrefix(string(*rawLine), h.Prefix) {
+	line := bytes.TrimSpace(*rawLine)
+	if !bytes.HasPrefix(line, []byte("data:")) {
 		*rawLine = nil
 		return
 	}
-
-	// 去除前缀
-	*rawLine = (*rawLine)[6:]
-
-	var openaiResponse types.OpenAIResponsesStreamResponses
-	err := json.Unmarshal(*rawLine, &openaiResponse)
-	if err != nil {
-		errChan <- common.ErrorToOpenAIError(err)
+	line = bytes.TrimSpace(line[len("data:"):])
+	if bytes.Equal(line, []byte("[DONE]")) {
+		if err := h.ValidateChatEOF(); err != nil {
+			errChan <- err
+		}
+		*rawLine = requester.StreamClosed
 		return
 	}
-
-	chatRes := types.ChatCompletionStreamResponse{
-		ID:      h.MessageID,
-		Object:  "chat.completion.chunk",
-		Created: utils.GetTimestamp(),
-		Model:   h.Model,
-		Choices: make([]types.ChatCompletionStreamChoice, 0),
+	var event types.OpenAIResponsesStreamResponses
+	if err := json.Unmarshal(line, &event); err != nil {
+		errChan <- common.ErrorToOpenAIError(err)
+		*rawLine = requester.StreamClosed
+		return
 	}
+	base.AccumulateResponsesStreamText(&event, h.Usage)
+	choice := types.ChatCompletionStreamChoice{Index: 0, Delta: types.ChatCompletionStreamChoiceDelta{}}
 	needOutput := false
-
-	// 累积计费 output 文本（正文/推理/函数调用参数）：与 HandlerResponsesStream 口径一致，集中登记于 helper，
-	// 避免新增 delta 事件时此处漏累积（终止事件不在 helper case 列表，上提到 switch 前不会误累积）。
-	base.AccumulateResponsesStreamText(&openaiResponse, h.Usage)
-
-	switch openaiResponse.Type {
+	switch event.Type {
+	case "error":
+		message := "upstream Responses stream failed"
+		if event.Message != nil {
+			message = *event.Message
+		}
+		errChan <- &types.OpenAIError{Type: "upstream_error", Code: "response_failed", Message: message}
+		*rawLine = requester.StreamClosed
+		return
 	case "response.created":
-		if openaiResponse.Response != nil {
-			if h.MessageID == "" {
-				h.MessageID = openaiResponse.Response.ID
-				chatRes.ID = h.MessageID
-			}
+		if event.Response == nil {
+			break
 		}
-		if len(openaiResponse.Response.Tools) > 0 {
-			for _, tool := range openaiResponse.Response.Tools {
-				if tool.Type == types.APITollTypeWebSearchPreview {
-					h.searchType = "medium"
-					if tool.SearchContextSize != "" {
-						h.searchType = tool.SearchContextSize
-					}
-				}
-			}
-		}
-		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-			Index: 0,
-			Delta: types.ChatCompletionStreamChoiceDelta{},
-		})
-		needOutput = true
-	case "response.output_text.delta": // 处理文本输出的增量
-		delta, _ := openaiResponse.Delta.(string)
-		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-			Index: 0,
-			Delta: types.ChatCompletionStreamChoiceDelta{
-				Content: delta,
-			},
-		})
-		needOutput = true
-	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta": // 推理文本（summary 与原始 reasoning）增量
-		delta, _ := openaiResponse.Delta.(string)
-		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-			Index: 0,
-			Delta: types.ChatCompletionStreamChoiceDelta{
-				ReasoningContent: delta,
-			},
-		})
-		needOutput = true
-	case "response.function_call_arguments.delta": // 处理函数调用参数的增量
-		delta, _ := openaiResponse.Delta.(string)
-		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-			Index: 0,
-			Delta: types.ChatCompletionStreamChoiceDelta{
-				Role: types.ChatMessageRoleAssistant,
-				ToolCalls: []*types.ChatCompletionToolCalls{
-					{
-						Index: h.toolIndex,
-						Function: &types.ChatCompletionToolCallsFunction{
-							Arguments: delta,
-						},
-					},
-				},
-			},
-		})
-		needOutput = true
-	case "response.function_call_arguments.done":
-		h.toolIndex++
-	case "response.output_item.added":
-		if openaiResponse.Item != nil {
-			switch openaiResponse.Item.Type {
-			case types.InputTypeWebSearchCall:
+		h.MessageID = event.Response.ID
+		for _, tool := range event.Response.Tools {
+			if tool.Type == types.APITollTypeWebSearchPreview {
+				h.searchType = tool.SearchContextSize
 				if h.searchType == "" {
 					h.searchType = "medium"
 				}
-				h.Usage.IncExtraBilling(types.APITollTypeWebSearchPreview, h.searchType)
-			case types.InputTypeCodeInterpreterCall:
-				h.Usage.IncExtraBilling(types.APITollTypeCodeInterpreter, "")
-			case types.InputTypeFileSearchCall:
-				h.Usage.IncExtraBilling(types.APITollTypeFileSearch, "")
-
-			case types.InputTypeMessage, types.InputTypeReasoning:
-				chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-					Index: 0,
-					Delta: types.ChatCompletionStreamChoiceDelta{
-						Role:    types.ChatMessageRoleAssistant,
-						Content: "",
-					},
-				})
-				needOutput = true
-			case types.InputTypeFunctionCall:
-				chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-					Index: 0,
-					Delta: types.ChatCompletionStreamChoiceDelta{
-						Role: types.ChatMessageRoleAssistant,
-						ToolCalls: []*types.ChatCompletionToolCalls{
-							{
-								Index: h.toolIndex,
-								Id:    openaiResponse.Item.CallID,
-								Type:  "function",
-								Function: &types.ChatCompletionToolCallsFunction{
-									Name:      openaiResponse.Item.Name,
-									Arguments: openaiResponse.Item.ArgumentsString(),
-								},
-							},
-						},
-					},
-				})
-				needOutput = true
 			}
 		}
-	default:
-		// 终止事件携带最终 usage：判定与提取统一走 base helper（与原生 responses 路径共享）。
-		if base.ExtractResponsesStreamUsage(&openaiResponse, h.Usage) {
-			getResponsesExtraBilling(openaiResponse.Response, h.Usage)
-			chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
-				Index:        0,
-				Delta:        types.ChatCompletionStreamChoiceDelta{},
-				FinishReason: types.ConvertResponsesStatusToChat(openaiResponse.Response.Status),
-			})
+		choice.Delta.Role = types.ChatMessageRoleAssistant
+		needOutput = true
+	case "response.output_text.delta":
+		choice.Delta.Content, _ = event.Delta.(string)
+		needOutput = true
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		choice.Delta.ReasoningContent, _ = event.Delta.(string)
+		needOutput = true
+	case "response.output_item.added":
+		if event.Item == nil {
+			break
+		}
+		switch event.Item.Type {
+		case types.InputTypeWebSearchCall:
+			if h.searchType == "" {
+				h.searchType = "medium"
+			}
+			h.Usage.IncExtraBilling(types.APITollTypeWebSearchPreview, h.searchType)
+		case types.InputTypeCodeInterpreterCall, types.InputTypeFileSearchCall:
+			h.Usage.IncExtraBilling(strings.TrimSuffix(event.Item.Type, "_call"), "")
+		case types.InputTypeFunctionCall:
+			if event.Item.CallID == "" || event.Item.Name == "" {
+				errChan <- &types.OpenAIError{Type: "upstream_error", Code: "invalid_tool_call", Message: "upstream function call has no call ID or name"}
+				*rawLine = requester.StreamClosed
+				return
+			}
+			if h.toolIndices == nil {
+				h.toolIndices = make(map[string]int)
+			}
+			index := len(h.chatTools)
+			h.chatTools = append(h.chatTools, responsesChatTool{arguments: event.Item.ArgumentsString()})
+			if event.Item.ID != "" {
+				h.toolIndices["id:"+event.Item.ID] = index
+			}
+			if event.OutputIndex != nil {
+				h.toolIndices[fmt.Sprintf("index:%d", *event.OutputIndex)] = index
+			}
+			choice.Delta.Role = types.ChatMessageRoleAssistant
+			choice.Delta.ToolCalls = []*types.ChatCompletionToolCalls{{Index: index, Id: event.Item.CallID, Type: "function",
+				Function: &types.ChatCompletionToolCallsFunction{Name: event.Item.Name, Arguments: event.Item.ArgumentsString()}}}
 			needOutput = true
 		}
+	case "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done":
+		if event.Type == "response.output_item.done" && (event.Item == nil || event.Item.Type != types.InputTypeFunctionCall) {
+			break
+		}
+		index, ok := h.chatToolIndex(&event)
+		if !ok {
+			errChan <- &types.OpenAIError{Type: "upstream_error", Code: "invalid_tool_call", Message: "upstream function arguments have no matching call"}
+			*rawLine = requester.StreamClosed
+			return
+		}
+		var delta string
+		if event.Type == "response.function_call_arguments.delta" {
+			var ok bool
+			delta, ok = event.Delta.(string)
+			if !ok || h.chatTools[index].complete {
+				errChan <- &types.OpenAIError{Type: "upstream_error", Code: "invalid_tool_call", Message: "upstream function arguments changed after completion or were not text"}
+				*rawLine = requester.StreamClosed
+				return
+			}
+			h.chatTools[index].arguments += delta
+		} else {
+			var arguments string
+			if event.Item != nil {
+				arguments = event.Item.ArgumentsString()
+			} else if text, ok := event.Arguments.(string); ok {
+				arguments = text
+			} else if event.Arguments != nil {
+				raw, _ := json.Marshal(event.Arguments)
+				arguments = string(raw)
+			}
+			var err error
+			delta, err = h.finishChatTool(index, arguments)
+			if err != nil {
+				errChan <- err
+				*rawLine = requester.StreamClosed
+				return
+			}
+		}
+		if delta != "" {
+			choice.Delta.ToolCalls = []*types.ChatCompletionToolCalls{{Index: index, Function: &types.ChatCompletionToolCallsFunction{Arguments: delta}}}
+			needOutput = true
+		}
+	default:
+		if !base.IsResponsesTerminalEvent(event.Type) {
+			break
+		}
+		base.ExtractResponsesStreamUsage(&event, h.Usage)
+		if event.Response == nil || event.Type == "response.failed" || event.Response.Status != types.ResponseStatusCompleted && event.Response.Status != types.ResponseStatusIncomplete || event.Response.Error != nil {
+			apiErr := &types.OpenAIError{Type: "upstream_error", Code: "response_failed", Message: "upstream Responses stream failed"}
+			if event.Response != nil && event.Response.Error != nil {
+				apiErr = event.Response.Error
+			}
+			errChan <- apiErr
+			*rawLine = requester.StreamClosed
+			return
+		}
+		getResponsesExtraBilling(event.Response, h.Usage)
+		finish := types.ConvertResponsesStatusToChat(event.Response.Status)
+		if event.Type == "response.incomplete" {
+			finish = types.FinishReasonLength
+		}
+		if len(h.chatTools) > 0 && finish == types.FinishReasonStop {
+			for _, tool := range h.chatTools {
+				if !validFunctionArguments(tool.arguments) {
+					errChan <- &types.OpenAIError{Type: "upstream_error", Code: "invalid_tool_call", Message: "upstream completed with incomplete function arguments"}
+					*rawLine = requester.StreamClosed
+					return
+				}
+			}
+			finish = types.FinishReasonToolCalls
+		}
+		h.chatTerminal = true
+		choice.FinishReason = finish
+		needOutput = true
+		*rawLine = requester.StreamClosed
 	}
-
 	if needOutput {
-		jsonData, err := json.Marshal(chatRes)
+		chatRes := types.ChatCompletionStreamResponse{ID: h.MessageID, Object: "chat.completion.chunk", Created: utils.GetTimestamp(), Model: h.Model, Choices: []types.ChatCompletionStreamChoice{choice}}
+		data, err := json.Marshal(chatRes)
 		if err != nil {
 			errChan <- common.ErrorToOpenAIError(err)
 			return
 		}
-		dataChan <- string(jsonData)
-
-		return
+		dataChan <- string(data)
+	} else {
+		*rawLine = nil
 	}
-
-	*rawLine = nil
 }
 
 func getResponsesExtraBilling(response *types.OpenAIResponsesResponses, usage *types.Usage) {

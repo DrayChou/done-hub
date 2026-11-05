@@ -159,7 +159,7 @@ func (p *BedrockProvider) CreateResponsesStream(request *types.OpenAIResponsesRe
 	}
 
 	if request.ConvertChat {
-		return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream)
+		return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream, chatHandler.ValidateChatEOF)
 	}
 
 	return requester.RequestNoTrimStream(p.Requester, resp, chatHandler.HandlerResponsesStream)

@@ -560,6 +560,15 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 		Temperature:       c.Temperature,
 		ToolChoice:        c.ToolChoice,
 		TopP:              c.TopP,
+		Store:             c.Store,
+	}
+	if c.Instructions != nil {
+		res.Instructions = *c.Instructions
+	}
+	if choice, ok := c.ToolChoice.(map[string]any); ok && choice["type"] == "function" {
+		if fn, ok := choice["function"].(map[string]any); ok {
+			res.ToolChoice = map[string]any{"type": "function", "name": fn["name"]}
+		}
 	}
 
 	if c.ResponseFormat != nil {
@@ -622,8 +631,9 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 				continue
 			}
 
-			tool.ResponsesTools.Type = tool.Type
-			resTools = append(resTools, tool.ResponsesTools)
+			responseTool := tool.ResponsesTools
+			responseTool.Type = tool.Type
+			resTools = append(resTools, responseTool)
 		}
 
 		if len(resTools) > 0 {
@@ -632,7 +642,17 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 	}
 
 	inputs := make([]InputResponses, 0)
-	for _, msg := range c.Messages {
+	messages := c.Messages
+	if c.System != nil {
+		messages = append([]ChatCompletionMessage{{Role: ChatMessageRoleSystem, Content: c.System}}, messages...)
+	}
+	for _, msg := range messages {
+		// An assistant can speak and call tools in the same message. Preserve
+		// its text before the function calls rather than silently discarding it.
+		if len(msg.ToolCalls) > 0 && msg.StringContent() != "" {
+			inputs = append(inputs, InputResponses{Type: InputTypeMessage, Role: msg.Role,
+				Content: []ContentResponses{{Type: ContentTypeOutputText, Text: msg.StringContent()}}})
+		}
 		// 处理ToolCalls
 		if len(msg.ToolCalls) > 0 {
 			for _, tool := range msg.ToolCalls {
@@ -677,6 +697,7 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 				inputContent = append(inputContent, ContentResponses{
 					Type:     ContentTypeInputImage,
 					ImageUrl: part.ImageURL.URL,
+					Detail:   part.ImageURL.Detail,
 				})
 			case ContentTypeText:
 				roleType := ContentTypeInputText

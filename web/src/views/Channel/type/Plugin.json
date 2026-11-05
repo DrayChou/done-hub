@@ -1,4 +1,18 @@
 {
+  "1": {
+    "chat_to_responses": {
+      "name": "Chat 转 Responses",
+      "description": "保持客户端 Chat 接口不变，把指定模型转到本渠道的 Responses 接口。仅在已确认上游支持 Responses 时配置；不根据平台名称猜测，不自动换模型。留空关闭。",
+      "params": {
+        "models": {
+          "name": "需要转换的模型",
+          "description": "逗号分隔的模型名（支持公开别名或映射后名称）；* 表示本渠道全部模型。与“Responses 转 Chat 兼容”方向相反。",
+          "type": "string",
+          "required": false
+        }
+      }
+    }
+  },
   "16": {
     "retrieval": {
       "name": "知识库",
@@ -174,11 +188,11 @@
   "25": {
     "gemini_signature_autofill": {
       "name": "缺失思考签名兼容",
-      "description": "工具调用的真实 thoughtSignature 自动按调用 ID 缓存并回传。仅当已确认上游接受跳过校验标记时启用此兜底；缓存丢失、跨客户端历史或重启后可能丢失原思考链。已有签名保持不变。仅原生 Gemini 转换路径生效。",
+      "description": "工具调用的真实 thoughtSignature 自动按调用 ID 缓存并回传。仅当已确认上游接受跳过校验标记时启用：缺签名时兜底，明确签名校验 400 时向同一渠道补救一次。首次保留真实签名，兼容降级可能丢失原思考链。适用于 Chat 转 Gemini 和原生 Gemini，不适用于 use_openai_api。",
       "params": {
         "enable": {
           "name": "启用缺签名兜底",
-          "description": "缺少可恢复签名时才使用 skip_thought_signature_validator；默认关闭，不影响其他渠道。",
+          "description": "缺签名或明确签名校验失败时使用 skip_thought_signature_validator；最多补救一次且共享原超时预算，默认关闭，不影响其他渠道。",
           "type": "bool",
           "required": true
         }
@@ -256,6 +270,18 @@
   },
 
   "8": {
+    "chat_to_responses": {
+      "name": "Chat 转 Responses",
+      "description": "把指定模型的 Chat 请求转到本渠道的 Responses 接口，再转换回 Chat。仅在上游支持 Responses 时配置；可配合下方 Responses 地址。留空关闭。",
+      "params": {
+        "models": {
+          "name": "需要转换的模型",
+          "description": "逗号分隔的模型名，匹配公开别名或映射后名称；* 表示本渠道全部模型。不自动切换模型。",
+          "type": "string",
+          "required": false
+        }
+      }
+    },
     "customize": {
       "name": "自定义参数",
       "description": "你可以自定义每个请求的地址，空为默认值，disable为禁用该请求",

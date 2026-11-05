@@ -932,15 +932,18 @@ func (r *OpenAIResponsesResponses) ToChat() *ChatCompletionResponse {
 		Message: ChatCompletionMessage{
 			Role: ChatMessageRoleAssistant,
 		},
-		FinishReason: FinishReasonStop,
+		FinishReason: ConvertResponsesStatusToChat(r.Status),
 	}
+	var text, reasoning string
+	incomplete := r.Status == ResponseStatusIncomplete
+	failed := r.Status == ResponseStatusFailed || r.Status == ResponseStatusCancelled
 
 	for _, output := range r.Output {
 		switch output.Type {
 		case InputTypeMessage:
-			choice.Message.Content = output.StringContent()
+			text += output.StringContent()
 		case InputTypeReasoning:
-			choice.Message.ReasoningContent = output.GetSummaryString()
+			reasoning += output.GetSummaryString()
 		case InputTypeFunctionCall:
 			if choice.Message.ToolCalls == nil {
 				choice.Message.ToolCalls = make([]*ChatCompletionToolCalls, 0)
@@ -956,12 +959,19 @@ func (r *OpenAIResponsesResponses) ToChat() *ChatCompletionResponse {
 			choice.FinishReason = FinishReasonToolCalls
 		}
 
-		if output.Status == ResponseStatusFailed || output.Status == ResponseStatusIncomplete {
-			choice.FinishReason = ConvertResponsesStatusToChat(output.Status)
-		}
-
+		incomplete = incomplete || output.Status == ResponseStatusIncomplete
+		failed = failed || output.Status == ResponseStatusFailed
 	}
 
+	// A partial function_call is not an executable tool turn. Root/item failure
+	// semantics must win even when another output item contains a function call.
+	if failed {
+		choice.FinishReason = FinishReasonContentFilter
+	} else if incomplete {
+		choice.FinishReason = FinishReasonLength
+	}
+	choice.Message.Content = text
+	choice.Message.ReasoningContent = reasoning
 	resp.Choices = append(resp.Choices, choice)
 
 	return resp

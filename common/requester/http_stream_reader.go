@@ -6,6 +6,7 @@ import (
 	"done-hub/common/logger"
 	"done-hub/types"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"sync"
@@ -35,6 +36,7 @@ type streamReader[T streamable] struct {
 	NoTrim   bool
 
 	handlerPrefix HandlerPrefix[T]
+	validateEOF   func() error // optional protocol-level completion check, on the reader goroutine
 
 	DataChan chan T
 	ErrChan  chan error
@@ -112,6 +114,13 @@ func (stream *streamReader[T]) handleLine(rawLine []byte, readErr error) (stop b
 		}
 	}
 
+	// A clean HTTP EOF is not necessarily a completed application protocol.
+	// Only callers that require a terminal event opt into this validation.
+	if readErr == io.EOF && stream.validateEOF != nil {
+		if err := stream.validateEOF(); err != nil {
+			readErr = err
+		}
+	}
 	// 然后处理错误
 	if readErr != nil {
 		select {

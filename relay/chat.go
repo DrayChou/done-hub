@@ -5,6 +5,7 @@ import (
 	"done-hub/common/config"
 	"done-hub/common/requester"
 	"done-hub/common/utils"
+	"done-hub/model"
 	providersBase "done-hub/providers/base"
 	"done-hub/safty"
 	"done-hub/types"
@@ -110,8 +111,32 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 		return
 	}
 
-	if need2Response[r.modelName] {
+	// Protocol conversion must not bypass the same content checks as Chat.
+	if config.EnableSafe {
+		for _, message := range r.chatRequest.Messages {
+			if message.Content != nil {
+				CheckResult, _ := safty.CheckContent(message.Content)
+				if !CheckResult.IsSafe {
+					return common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest), true
+				}
+			}
+		}
+	}
+	bridge, bridgeErr := chatResponsesBridgeEnabled(r.provider.GetChannel(), r.getOriginalModel(), r.modelName)
+	if bridgeErr != nil {
+		return common.ErrorWrapperLocal(bridgeErr, "invalid_channel_config", http.StatusInternalServerError), true
+	}
+	if bridge || need2Response[r.modelName] {
 		resProvider, ok := r.provider.(providersBase.ResponsesInterface)
+		channelType := r.provider.GetChannel().Type
+		if bridge && (channelType != config.ChannelTypeOpenAI && channelType != config.ChannelTypeCustom || !ok || !r.provider.GetSupportedResponse() || !providerSupportsNativeResponses(r.provider, r.modelName)) {
+			return common.StringErrorWrapperLocal("configured Chat-to-Responses bridge is not supported by this channel/model", "unsupported_api", http.StatusNotImplemented), true
+		}
+		if bridge {
+			if err := validateChatResponsesInput(&r.chatRequest); err != nil {
+				return common.ErrorWrapperLocal(err, "unsupported_conversion", http.StatusBadRequest), true
+			}
+		}
 		if ok {
 			return r.compatibleSend(resProvider)
 		}
@@ -128,20 +153,6 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 	// 入口协议 == chat 且响应原样直返，放行 provider 的响应字节透传（保留上游指纹）。
 	// image / need2Response 等异协议兼容分支在上方已提前返回，不会走到这里。
 	r.c.Set(config.GinRawPassThroughAllowedKey, true)
-	// 内容审查
-	if config.EnableSafe {
-		for _, message := range r.chatRequest.Messages {
-			if message.Content != nil {
-				CheckResult, _ := safty.CheckContent(message.Content)
-				if !CheckResult.IsSafe {
-					err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-					done = true
-					return
-				}
-			}
-		}
-	}
-
 	if r.chatRequest.Stream {
 		var response requester.StreamReaderInterface[string]
 		response, err = chatProvider.CreateChatCompletionStream(&r.chatRequest)
@@ -180,6 +191,70 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 	}
 
 	return
+}
+
+// Explicit per-channel protocol selection reuses the existing Responses bridge.
+// Match public aliases or mapped upstream names; never guess from a provider's
+// hostname, response fingerprint or a generic HTTP 400. An empty list is off.
+func chatResponsesBridgeEnabled(channel *model.Channel, originalModel, mappedModel string) (bool, error) {
+	if channel.Plugin == nil {
+		return false, nil
+	}
+	settings, ok := channel.Plugin.Data()["chat_to_responses"]
+	if !ok {
+		return false, nil
+	}
+	value, exists := settings["models"]
+	if !exists {
+		return false, nil
+	}
+	models, ok := value.(string)
+	if !ok {
+		return false, errors.New("chat_to_responses.models must be a comma-separated string")
+	}
+	for _, name := range strings.Split(models, ",") {
+		name = strings.TrimSpace(name)
+		if name != "" && (name == "*" || name == originalModel || name == mappedModel) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Fail visibly for payloads the existing converter cannot represent. Do not
+// turn an opt-in protocol bridge into successful requests with missing content.
+func validateChatResponsesInput(request *types.ChatCompletionRequest) error {
+	if request.N != nil && *request.N > 1 || request.Stop != nil || request.Audio != nil || len(request.Functions) > 0 || request.FunctionCall != nil {
+		return errors.New("Chat-to-Responses bridge does not support n>1, stop, audio or legacy functions; use the native endpoint")
+	}
+	messages := request.Messages
+	if request.System != nil {
+		messages = append([]types.ChatCompletionMessage{{Role: types.ChatMessageRoleSystem, Content: request.System}}, messages...)
+	}
+	for _, message := range messages {
+		if message.FunctionCall != nil || message.Audio != nil || message.Refusal != "" {
+			return errors.New("Chat-to-Responses bridge cannot represent this message; use the native endpoint")
+		}
+		if message.Content == nil || message.ToolCallID != "" {
+			continue
+		}
+		if _, ok := message.Content.(string); ok {
+			continue
+		}
+		parts := message.ParseContent()
+		if len(parts) == 0 {
+			return errors.New("Chat-to-Responses bridge cannot parse message content")
+		}
+		for _, part := range parts {
+			if part.Type != types.ContentTypeText && part.Type != types.ContentTypeImageURL {
+				return fmt.Errorf("Chat-to-Responses bridge does not support content type %q; use the native endpoint", part.Type)
+			}
+			if len(message.ToolCalls) > 0 && part.Type != types.ContentTypeText {
+				return errors.New("Chat-to-Responses bridge cannot combine non-text assistant content with tool calls")
+			}
+		}
+	}
+	return nil
 }
 
 func (r *relayChat) getUsageResponse() string {
@@ -372,7 +447,11 @@ func writeChatStreamFrame(c *gin.Context, chunk types.ChatCompletionStreamRespon
 }
 
 func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {
+	// Response bytes are converted back to Chat, so do not pass a previous
+	// attempt's raw-response permission through to a native Responses provider.
+	r.c.Set(config.GinRawPassThroughAllowedKey, false)
 	resRequest := r.chatRequest.ToResponsesRequest()
+	resRequest.Model = r.modelName
 	resRequest.ConvertChat = true
 
 	if r.chatRequest.Stream {
