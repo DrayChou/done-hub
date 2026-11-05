@@ -479,6 +479,14 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		*rawLine = requester.StreamClosed
 		return
 	}
+	// Some aggregators wrap an upstream error as a successful HTTP stream
+	// followed by {status:"FAILED",detail:...}. Do not ignore that envelope
+	// or echo its arbitrary payload (which may contain credentials/input).
+	if strings.EqualFold(gjson.GetBytes(line, "status").String(), "failed") {
+		errChan <- &types.OpenAIError{Type: "upstream_error", Code: "response_failed", Message: "upstream gateway reported a failed Responses stream"}
+		*rawLine = requester.StreamClosed
+		return
+	}
 	base.AccumulateResponsesStreamText(&event, h.Usage)
 	choice := types.ChatCompletionStreamChoice{Index: 0, Delta: types.ChatCompletionStreamChoiceDelta{}}
 	needOutput := false

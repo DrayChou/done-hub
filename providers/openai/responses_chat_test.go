@@ -141,6 +141,7 @@ func TestResponsesChatFinalToolArguments(t *testing.T) {
 func TestResponsesChatFailureIsNotSuccess(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"error","message":"synthetic fail"}`,
+		`{"status":"FAILED","detail":"synthetic private input must not be echoed"}`,
 		`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"upstream_error","message":"synthetic fail"}}}`,
 		`{"type":"response.completed","response":{"id":"resp_1","status":"failed"}}`,
 		`{"type":"response.completed","response":{"id":"resp_1","status":"in_progress"}}`,
