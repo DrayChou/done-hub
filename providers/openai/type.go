@@ -1,6 +1,9 @@
 package openai
 
-import "done-hub/types"
+import (
+	"done-hub/types"
+	"encoding/json"
+)
 
 type OpenAIProviderChatResponse struct {
 	types.ChatCompletionResponse
@@ -27,6 +30,17 @@ func (c *OpenAIProviderCompletionResponse) getResponseText() (responseText strin
 
 type OpenAIProviderEmbeddingsResponse struct {
 	types.EmbeddingResponse
+	types.OpenAIErrorResponse
+}
+
+// OpenAIProviderRawEmbeddingsResponse accepts both the standard OpenAI
+// embedding array and vendor-native object payloads (such as Volcengine Ark
+// multimodal embeddings) so usage and errors can still be parsed safely.
+type OpenAIProviderRawEmbeddingsResponse struct {
+	Object string          `json:"object"`
+	Data   json.RawMessage `json:"data"`
+	Model  string          `json:"model"`
+	Usage  *types.Usage    `json:"usage,omitempty"`
 	types.OpenAIErrorResponse
 }
 
